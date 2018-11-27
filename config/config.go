@@ -36,9 +36,10 @@ import (
 	"io"
 	"os"
 
+	"fmt"
+
 	"github.com/BurntSushi/toml"
 	"github.com/op/go-logging"
-	"fmt"
 )
 
 var log = logging.MustGetLogger("honeytrap:config")
@@ -57,6 +58,7 @@ type Config struct {
 
 	Web toml.Primitive `toml:"web"`
 
+	//use toml.Primitive's. This enabled each service to be configured differently
 	Services  map[string]toml.Primitive `toml:"service"`
 	Ports     []toml.Primitive          `toml:"port"`
 	Directors map[string]toml.Primitive `toml:"director"`
@@ -68,6 +70,8 @@ type Config struct {
 		Output string `toml:"output"`
 		Level  string `toml:"level"`
 	} `toml:"logging"`
+
+	MiniDisplay map[string]toml.Primitive `toml:"minidisplay"`
 }
 
 // DefaultConfig defines the default Config to be used to set default values.

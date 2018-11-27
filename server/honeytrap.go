@@ -33,16 +33,18 @@ package server
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mattn/go-isatty"
-
+	"github.com/BurntSushi/toml"
 	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 
 	"github.com/honeytrap/honeytrap/cmd"
 	"github.com/honeytrap/honeytrap/config"
@@ -100,6 +102,13 @@ import (
 	_ "github.com/honeytrap/honeytrap/pushers/splunk"
 
 	"github.com/op/go-logging"
+
+	// display
+	"github.com/honeytrap/honeytrap/minidisplay/node"
+	"github.com/honeytrap/honeytrap/minidisplay/physical/button"
+	"github.com/honeytrap/honeytrap/minidisplay/userinterface"
+	lcd1602 "github.com/pimvanhespen/go-pi-lcd1602"
+	"github.com/pimvanhespen/go-pi-lcd1602/terminaLCD"
 )
 
 var log = logging.MustGetLogger("honeytrap/server")
@@ -121,7 +130,12 @@ type Honeytrap struct {
 	dataDir string
 
 	// Maps a port and a protocol to an array of pointers to services
-	ports map[net.Addr][]*ServiceMap
+	ports     map[net.Addr][]*ServiceMap
+	directors map[string]director.Director
+	services  map[string]*ServiceMap
+	channels  map[string]pushers.Channel
+
+	ui *userinterface.MiniDisplay
 }
 
 // New returns a new instance of a Honeytrap struct.
@@ -133,10 +147,13 @@ func New(options ...OptionFn) (*Honeytrap, error) {
 	conf := &config.Default
 
 	h := &Honeytrap{
-		config:   conf,
-		director: director.MustDummy(),
-		bus:      bus,
-		profiler: profiler.Dummy(),
+		config:    conf,
+		director:  director.MustDummy(),
+		bus:       bus,
+		profiler:  profiler.Dummy(),
+		services:  make(map[string]*ServiceMap),
+		channels:  make(map[string]pushers.Channel),
+		directors: map[string]director.Director{},
 	}
 
 	for _, fn := range options {
@@ -340,6 +357,334 @@ func compareAddr(addr1 net.Addr, addr2 net.Addr) bool {
 	return false
 }
 
+/*
+type Channel struct {
+	Type string `toml:"type"`
+}
+*/
+func (hc *Honeytrap) CreateChannel(key string, channelConfig toml.Primitive) pushers.Channel {
+	x := struct {
+		Type string `toml:"type"`
+	}{}
+
+	if err := hc.config.PrimitiveDecode(channelConfig, &x); err != nil {
+		log.Error("Error parsing configuration of channel: %s", err.Error())
+		return nil
+	}
+
+	channelType := x.Type
+	if channelType == "" {
+		log.Error("Error parsing configuration of channel %s: type not set", key)
+		return nil
+	}
+
+	channelFunc, ok := pushers.Get(channelType)
+	if !ok {
+		log.Error("Channel %s not supported on platform (%s)", channelType, key)
+		return nil
+	}
+	channel, err := channelFunc(
+		pushers.WithConfig(channelConfig, hc.config),
+	)
+	if err != nil {
+		log.Fatalf("Error initializing channel %s(%s): %s", key, channelType, err)
+		return nil
+	}
+
+	return channel
+}
+
+func (hc *Honeytrap) CreatePort(s toml.Primitive, l listener.Listener) {
+
+	x := struct {
+		Port     string   `toml:"port"`
+		Ports    []string `toml:"ports"`
+		Services []string `toml:"services"`
+	}{}
+
+	if err := hc.config.PrimitiveDecode(s, &x); err != nil {
+		log.Error("Error parsing configuration of generic ports: %s", err.Error())
+		return
+	}
+
+	var ports []string
+	if x.Ports != nil {
+		ports = x.Ports
+	}
+	if x.Port != "" {
+		ports = append(ports, x.Port)
+	}
+	if x.Port != "" && x.Ports != nil {
+		log.Warning("Both \"port\" and \"ports\" were defined, this can be confusing")
+	} else if x.Port == "" && x.Ports == nil {
+		log.Error("Neither \"port\" nor \"ports\" were defined")
+		return
+	}
+
+	if len(x.Services) == 0 {
+		log.Warning("No services defined for port(s) " + strings.Join(ports, ", "))
+	}
+
+	for _, portStr := range ports {
+		addr, _, _, err := ToAddr(portStr)
+		if err != nil {
+			log.Error("Error parsing port string: %s", err.Error())
+			continue
+		}
+		if addr == nil {
+			log.Error("Failed to bind: addr is nil")
+			continue
+		}
+
+		// Get the services from their names
+		var servicePtrs []*ServiceMap
+		for _, serviceName := range x.Services {
+			ptr, ok := hc.services[serviceName]
+			if !ok {
+				log.Error("Unknown service '%s' for port %s", serviceName, portStr)
+				continue
+			}
+			servicePtrs = append(servicePtrs, ptr)
+		}
+		if len(servicePtrs) == 0 {
+			log.Errorf("Port %s has no valid services, it won't be listened on", portStr)
+			continue
+		}
+
+		found := false
+		for k, _ := range hc.ports {
+			if !compareAddr(k, addr) {
+				continue
+			}
+
+			found = true
+		}
+
+		if found {
+			log.Error("Port %s was already defined, ignoring the newer definition", portStr)
+			continue
+		}
+
+		hc.ports[addr] = servicePtrs
+
+		a, ok := l.(listener.AddAddresser)
+		if !ok {
+			log.Error("Listener error")
+			continue
+		}
+		a.AddAddress(addr)
+
+		//TODO Pim van Hespen: display this after it is check the port has services
+		log.Infof("Configured port %s/%s", addr.Network(), addr.String())
+	}
+
+}
+
+func (hc *Honeytrap) CreateService(key string, s toml.Primitive) {
+	x := struct {
+		Type     string `toml:"type"`
+		Director string `toml:"director"`
+		Port     string `toml:"port"`
+	}{}
+
+	if err := hc.config.PrimitiveDecode(s, &x); err != nil {
+		log.Error("Error parsing configuration of service %s: %s", key, err.Error())
+		return
+	}
+
+	if x.Port != "" {
+		log.Error("Ports in services are deprecated, add services to ports instead")
+		return
+	}
+
+	// individual configuration per service
+	options := []services.ServicerFunc{
+		services.WithChannel(hc.bus),
+		services.WithConfig(s, hc.config),
+	}
+
+	if x.Director == "" {
+	} else if d, ok := hc.directors[x.Director]; ok {
+		options = append(options, services.WithDirector(d))
+	} else {
+		log.Error(color.RedString("Could not find director=%s for service=%s. Enabled directors: %s", x.Director, key, strings.Join(director.GetAvailableDirectorNames(), ", ")))
+		return
+	}
+
+	fn, ok := services.Get(x.Type)
+	if !ok {
+		log.Error(color.RedString("Could not find type %s for service %s", x.Type, key))
+		return
+	}
+
+	service := fn(options...)
+	hc.services[key] = &ServiceMap{
+		Service: service,
+		Name:    key,
+		Type:    x.Type,
+	}
+	log.Infof("Configured service %s (%s)", x.Type, key)
+
+}
+
+/*
+ *
+ */
+func (hc *Honeytrap) CreateMiniDisplay() {
+	encodedScreen := hc.config.MiniDisplay["screen"]
+	tomlButton := hc.config.MiniDisplay["button"]
+
+	typeStruct := struct {
+		Type string `toml:"type"`
+	}{}
+
+	buttonType, screenType := typeStruct, typeStruct //copy
+
+	if err := hc.config.PrimitiveDecode(encodedScreen, &screenType); err != nil {
+		log.Error("Error parsing configuration of screen: %s", err.Error())
+		return
+	}
+
+	if err := hc.config.PrimitiveDecode(tomlButton, &buttonType); err != nil {
+		log.Error("Error parsing configuration of buttons, %s", err)
+		return
+	}
+
+	if screenType.Type == "" {
+		log.Error("Error parsing configuration for screen. No screentype declared")
+		return
+	}
+	if buttonType.Type == "" {
+		log.Error("Error parsing configuration for buttons. No buttontype declared")
+		return
+	}
+
+	var screen lcd1602.LCDI
+	var buttonhandler button.ButtonHandler
+
+	if screenType.Type == "physical" {
+		s := struct {
+			RS        int   `toml:"rs"`
+			E         int   `toml:"e"`
+			Data      []int `toml:"data"`
+			Lines     int   `toml:"lines"`
+			Linewidth int   `toml:"linewidth"`
+		}{}
+
+		if err := hc.config.PrimitiveDecode(encodedScreen, &s); err != nil {
+			log.Error("Error parsing configuration of screen: %s", err)
+			return
+
+		} else {
+			screen = lcd1602.New(
+				s.RS,
+				s.E,
+				s.Data,
+				s.Linewidth,
+			)
+		}
+	} else if screenType.Type == "virtual" {
+		screen = &terminaLCD.TerminalLCD{}
+	} else {
+		log.Errorf("Error parsing configuration for screen. unknown type: '$s'", screenType.Type)
+		return
+	}
+
+	if buttonType.Type == "physical" {
+		s := struct {
+			Left  int `toml:"left"`
+			Right int `toml:"right"`
+			Up    int `toml:"up"`
+			Down  int `toml:"down"`
+		}{}
+
+		if err := hc.config.PrimitiveDecode(tomlButton, &s); err != nil {
+			log.Error("Error parsing configuration of buttons: %s", err)
+			return
+		}
+
+		h := button.NewPhysicalHandler()
+		h.Register(button.New(s.Left), button.LEFT)
+		h.Register(button.New(s.Up), button.UP)
+		h.Register(button.New(s.Right), button.RIGHT)
+		h.Register(button.New(s.Down), button.DOWN)
+		buttonhandler = h
+
+	} else if buttonType.Type == "virtual" {
+		buttonhandler = button.NewArrowKeyHandler()
+	} else {
+		log.Errorf("Error parsing configuration for buttons. unknown type: '$s'", buttonType.Type)
+		return
+	}
+
+	root := &node.Root{
+		Name: "Honeytrap",
+	}
+
+	tokenData := &node.Data{
+		Name:    "Token",
+		Parent:  root,
+		DataSrc: &node.MockDataSource{hc.token},
+		Width:   screen.Width(),
+	}
+	root.Children = append(root.Children, tokenData)
+
+	//services
+	servicesNode := &node.Link{
+		Name:   "Services",
+		Parent: root,
+	}
+	root.Children = append(root.Children, servicesNode)
+
+	for _, servicemaps := range hc.ports {
+		for _, servicemap := range servicemaps {
+			serviceNode := &node.Link{
+				Name:   (servicemap).Name,
+				Parent: servicesNode,
+			}
+			servicesNode.Children = append(servicesNode.Children, serviceNode)
+
+			dataChild := &node.Data{
+				Name:    "Type",
+				Parent:  serviceNode,
+				DataSrc: &node.MockDataSource{(servicemap).Type},
+				Width:   screen.Width(),
+			}
+			serviceNode.Children = append(serviceNode.Children, dataChild)
+		}
+	}
+
+	//TODO: this ur should go to some other server?
+	resp, err := http.Get("https://api.ipify.org")
+
+	ipaddr := "unknown"
+
+	if err == nil {
+
+		defer resp.Body.Close()
+		content, err := ioutil.ReadAll(resp.Body)
+
+		if err == nil {
+			ipaddr = string(content[0:])
+		}
+	}
+
+	ipaddrData := &node.Data{
+		Name:    "External IP",
+		Parent:  root,
+		DataSrc: &node.MockDataSource{ipaddr},
+		Width:   screen.Width(),
+	}
+	root.Children = append(root.Children, ipaddrData)
+
+	// init ui
+	hc.ui = userinterface.New(screen, buttonhandler, root)
+
+	userinterface.WelcomeScreenBee(hc.ui.Display)
+	time.Sleep(1 * time.Second)
+	hc.ui.Refresh()
+}
+
 // Run will start honeytrap
 func (hc *Honeytrap) Run(ctx context.Context) {
 	if IsTerminal(os.Stdout) {
@@ -373,36 +718,22 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	w.Start()
 
-	channels := map[string]pushers.Channel{}
+	//TODO pimvanhespen: get this map out of here
 	isChannelUsed := make(map[string]bool)
+
 	// sane defaults!
 
-	for key, s := range hc.config.Channels {
-		x := struct {
-			Type string `toml:"type"`
-		}{}
+	//create channels
+	for key, channelConfig := range hc.config.Channels {
 
-		err := hc.config.PrimitiveDecode(s, &x)
-		if err != nil {
-			log.Error("Error parsing configuration of channel: %s", err.Error())
+		channel := hc.CreateChannel(key, channelConfig)
+		if channel == nil {
 			continue
 		}
 
-		if x.Type == "" {
-			log.Error("Error parsing configuration of channel %s: type not set", key)
-			continue
-		}
+		hc.channels[key] = channel
+		isChannelUsed[key] = false
 
-		if channelFunc, ok := pushers.Get(x.Type); !ok {
-			log.Error("Channel %s not supported on platform (%s)", x.Type, key)
-		} else if d, err := channelFunc(
-			pushers.WithConfig(s, hc.config),
-		); err != nil {
-			log.Fatalf("Error initializing channel %s(%s): %s", key, x.Type, err)
-		} else {
-			channels[key] = d
-			isChannelUsed[key] = false
-		}
 	}
 
 	// subscribe default to global bus
@@ -411,6 +742,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	hc.bus.Subscribe(bc)
 
 	for _, s := range hc.config.Filters {
+
 		x := struct {
 			Channels   []string `toml:"channel"`
 			Services   []string `toml:"services"`
@@ -424,7 +756,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		}
 
 		for _, name := range x.Channels {
-			channel, ok := channels[name]
+			channel, ok := hc.channels[name]
 			if !ok {
 				log.Error("Could not find channel %s for filter", name)
 				continue
@@ -454,7 +786,6 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	}
 
 	// initialize directors
-	directors := map[string]director.Director{}
 	availableDirectorNames := director.GetAvailableDirectorNames()
 
 	for key, s := range hc.config.Directors {
@@ -481,7 +812,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		); err != nil {
 			log.Fatalf("Error initializing director %s(%s): %s", key, x.Type, err)
 		} else {
-			directors[key] = d
+			hc.directors[key] = d
 		}
 	}
 
@@ -500,58 +831,13 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	}
 
 	var enabledDirectorNames []string
-	for key := range directors {
+	for key := range hc.directors {
 		enabledDirectorNames = append(enabledDirectorNames, key)
 	}
 
-	serviceList := make(map[string]*ServiceMap)
-	isServiceUsed := make(map[string]bool) // Used to check that every service is used by a port
 	// same for proxies
 	for key, s := range hc.config.Services {
-		x := struct {
-			Type     string `toml:"type"`
-			Director string `toml:"director"`
-			Port     string `toml:"port"`
-		}{}
-
-		if err := hc.config.PrimitiveDecode(s, &x); err != nil {
-			log.Error("Error parsing configuration of service %s: %s", key, err.Error())
-			continue
-		}
-
-		if x.Port != "" {
-			log.Error("Ports in services are deprecated, add services to ports instead")
-			continue
-		}
-
-		// individual configuration per service
-		options := []services.ServicerFunc{
-			services.WithChannel(hc.bus),
-			services.WithConfig(s, hc.config),
-		}
-
-		if x.Director == "" {
-		} else if d, ok := directors[x.Director]; ok {
-			options = append(options, services.WithDirector(d))
-		} else {
-			log.Error(color.RedString("Could not find director=%s for service=%s. Enabled directors: %s", x.Director, key, strings.Join(enabledDirectorNames, ", ")))
-			continue
-		}
-
-		fn, ok := services.Get(x.Type)
-		if !ok {
-			log.Error(color.RedString("Could not find type %s for service %s", x.Type, key))
-			continue
-		}
-
-		service := fn(options...)
-		serviceList[key] = &ServiceMap{
-			Service: service,
-			Name:    key,
-			Type:    x.Type,
-		}
-		isServiceUsed[key] = false
-		log.Infof("Configured service %s (%s)", x.Type, key)
+		hc.CreateService(key, s)
 	}
 
 	listenerFunc, ok := listener.Get(x.Type)
@@ -570,93 +856,35 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	hc.ports = make(map[net.Addr][]*ServiceMap)
 	for _, s := range hc.config.Ports {
-		x := struct {
-			Port     string   `toml:"port"`
-			Ports    []string `toml:"ports"`
-			Services []string `toml:"services"`
-		}{}
+		hc.CreatePort(s, l)
+	}
 
-		if err := hc.config.PrimitiveDecode(s, &x); err != nil {
-			log.Error("Error parsing configuration of generic ports: %s", err.Error())
-			continue
-		}
+	//check if all services are assigned to ports
+	knownServicePointers := []*ServiceMap{}
+	for _, serviceMaps := range hc.ports {
+		knownServicePointers = append(knownServicePointers, serviceMaps...)
+	}
 
-		var ports []string
-		if x.Ports != nil {
-			ports = x.Ports
-		}
-		if x.Port != "" {
-			ports = append(ports, x.Port)
-		}
-		if x.Port != "" && x.Ports != nil {
-			log.Warning("Both \"port\" and \"ports\" were defined, this can be confusing")
-		} else if x.Port == "" && x.Ports == nil {
-			log.Error("Neither \"port\" nor \"ports\" were defined")
-			continue
-		}
-
-		if len(x.Services) == 0 {
-			log.Warning("No services defined for port(s) " + strings.Join(ports, ", "))
-		}
-
-		for _, portStr := range ports {
-			addr, _, _, err := ToAddr(portStr)
-			if err != nil {
-				log.Error("Error parsing port string: %s", err.Error())
-				continue
-			}
-			if addr == nil {
-				log.Error("Failed to bind: addr is nil")
-				continue
-			}
-
-			// Get the services from their names
-			var servicePtrs []*ServiceMap
-			for _, serviceName := range x.Services {
-				ptr, ok := serviceList[serviceName]
-				if !ok {
-					log.Error("Unknown service '%s' for port %s", serviceName, portStr)
-					continue
+	for serviceName, serviceMapPointer := range hc.services {
+		// check if service is listed in the services mapped to ports
+		if !func() bool {
+			for _, pointer := range knownServicePointers {
+				if pointer == serviceMapPointer {
+					return true
 				}
-				servicePtrs = append(servicePtrs, ptr)
-				isServiceUsed[serviceName] = true
 			}
-			if len(servicePtrs) == 0 {
-				log.Errorf("Port %s has no valid services, it won't be listened on", portStr)
-				continue
-			}
-
-			found := false
-			for k, _ := range hc.ports {
-				if !compareAddr(k, addr) {
-					continue
-				}
-
-				found = true
-			}
-
-			if found {
-				log.Error("Port %s was already defined, ignoring the newer definition", portStr)
-				continue
-			}
-
-			hc.ports[addr] = servicePtrs
-
-			a, ok := l.(listener.AddAddresser)
-			if !ok {
-				log.Error("Listener error")
-				continue
-			}
-			a.AddAddress(addr)
-
-			log.Infof("Configured port %s/%s", addr.Network(), addr.String())
+			return false
+		}() {
+			log.Warningf("Service %s is defined but not used", serviceName)
 		}
 	}
 
-	for name, isUsed := range isServiceUsed {
-		if !isUsed {
-			log.Warningf("Service %s is defined but not used", name)
-		}
+	// config of mini diplay
+	if len(hc.config.MiniDisplay) == 0 {
+		log.Info("Starting without MiniDisplay")
+	} else {
+		log.Info("Starting with Minidisplay")
+		hc.CreateMiniDisplay()
 	}
 
 	if len(hc.config.Undecoded()) != 0 {
@@ -685,9 +913,27 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		}
 	}()
 
+	stopminidisplay := make(chan interface{}, 1)
+
+	if hc.ui != nil {
+		go func() {
+			ticker := time.NewTicker(time.Second / 15)
+			//Loop:
+			for {
+				select {
+				case <-ticker.C:
+					hc.ui.Update()
+				case <-stopminidisplay:
+					ticker.Stop()
+					break
+				}
+			}
+		}()
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			stopminidisplay <- struct{}{}
 			return
 		case conn := <-incoming:
 			go hc.handle(conn)
