@@ -12,7 +12,7 @@
 * details.
 *
 * You should have received a copy of the GNU Affero General Public License
-* version 3 along with this program in the file "LICENSE".  If not, see
+* version 3 along with this program in the file "LICENSE".  If not, shttps://www.101domain.com/domain-availability-search.htmee
 * <http://www.gnu.org/licenses/agpl-3.0.txt>.
 *
 * See https://honeytrap.io/ for more details. All requests should be sent to

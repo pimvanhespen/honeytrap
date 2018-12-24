@@ -48,6 +48,7 @@ import (
 
 	"github.com/honeytrap/honeytrap/cmd"
 	"github.com/honeytrap/honeytrap/config"
+	"github.com/honeytrap/honeytrap/config/validator"
 	"github.com/honeytrap/honeytrap/web"
 
 	"github.com/honeytrap/honeytrap/director"
@@ -156,6 +157,7 @@ func New(options ...OptionFn) (*Honeytrap, error) {
 		director:  director.MustDummy(),
 		bus:       bus,
 		profiler:  profiler.Dummy(),
+		ports:     make(map[net.Addr][]*ServiceMap),
 		services:  make(map[string]*ServiceMap),
 		channels:  make(map[string]pushers.Channel),
 		directors: map[string]director.Director{},
@@ -362,11 +364,6 @@ func compareAddr(addr1 net.Addr, addr2 net.Addr) bool {
 	return false
 }
 
-/*
-type Channel struct {
-	Type string `toml:"type"`
-}
-*/
 func (hc *Honeytrap) CreateChannel(key string, channelConfig toml.Primitive) pushers.Channel {
 	x := struct {
 		Type string `toml:"type"`
@@ -485,7 +482,7 @@ func (hc *Honeytrap) CreatePort(s toml.Primitive, l listener.Listener) {
 
 }
 
-func (hc *Honeytrap) CreateService(key string, s toml.Primitive) {
+func (hc *Honeytrap) CreateService(key string, s toml.Primitive) *ServiceMap {
 	x := struct {
 		Type     string `toml:"type"`
 		Director string `toml:"director"`
@@ -494,12 +491,12 @@ func (hc *Honeytrap) CreateService(key string, s toml.Primitive) {
 
 	if err := hc.config.PrimitiveDecode(s, &x); err != nil {
 		log.Error("Error parsing configuration of service %s: %s", key, err.Error())
-		return
+		return nil
 	}
 
 	if x.Port != "" {
 		log.Error("Ports in services are deprecated, add services to ports instead")
-		return
+		return nil
 	}
 
 	// individual configuration per service
@@ -513,23 +510,21 @@ func (hc *Honeytrap) CreateService(key string, s toml.Primitive) {
 		options = append(options, services.WithDirector(d))
 	} else {
 		log.Error(color.RedString("Could not find director=%s for service=%s. Enabled directors: %s", x.Director, key, strings.Join(director.GetAvailableDirectorNames(), ", ")))
-		return
+		return nil
 	}
 
 	fn, ok := services.Get(x.Type)
 	if !ok {
 		log.Error(color.RedString("Could not find type %s for service %s", x.Type, key))
-		return
+		return nil
 	}
 
 	service := fn(options...)
-	hc.services[key] = &ServiceMap{
+	return &ServiceMap{
 		Service: service,
 		Name:    key,
 		Type:    x.Type,
 	}
-	log.Infof("Configured service %s (%s)", x.Type, key)
-
 }
 
 func (hc *Honeytrap) CreateMiniDisplay() {
@@ -722,6 +717,13 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	w.Start()
 
+	// subscribe default to global bus
+	// maybe we can rewrite pushers / channels to use global bus instead
+	bc := pushers.NewBusChannel()
+	hc.bus.Subscribe(bc)
+
+	_ = validator.Validate(hc.config)
+
 	//TODO pimvanhespen: get this map out of here
 	isChannelUsed := make(map[string]bool)
 
@@ -740,11 +742,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	}
 
-	// subscribe default to global bus
-	// maybe we can rewrite pushers / channels to use global bus instead
-	bc := pushers.NewBusChannel()
-	hc.bus.Subscribe(bc)
-
+	// create filters
 	for _, s := range hc.config.Filters {
 
 		x := struct {
@@ -783,6 +781,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		}
 	}
 
+	// check if all channels are in use
 	for name, isUsed := range isChannelUsed {
 		if !isUsed {
 			log.Warningf("Channel %s is unused. Did you forget to add a filter?", name)
@@ -790,6 +789,8 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	}
 
 	// initialize directors
+
+	// variable only used for error.
 	availableDirectorNames := director.GetAvailableDirectorNames()
 
 	for key, s := range hc.config.Directors {
@@ -820,6 +821,21 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		}
 	}
 
+	var enabledDirectorNames []string
+	for key := range hc.directors {
+		enabledDirectorNames = append(enabledDirectorNames, key)
+	}
+
+	// same for services
+	for key, s := range hc.config.Services {
+		service := hc.CreateService(key, s)
+		if service == nil {
+			continue
+		}
+		hc.services[key] = service
+		log.Infof("Configured service (%s)", key) // x.Type removed
+	}
+
 	// initialize listener
 	x := struct {
 		Type string `toml:"type"`
@@ -832,16 +848,6 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	if x.Type == "" {
 		fmt.Println(color.RedString("Listener not set"))
-	}
-
-	var enabledDirectorNames []string
-	for key := range hc.directors {
-		enabledDirectorNames = append(enabledDirectorNames, key)
-	}
-
-	// same for proxies
-	for key, s := range hc.config.Services {
-		hc.CreateService(key, s)
 	}
 
 	listenerFunc, ok := listener.Get(x.Type)
@@ -858,7 +864,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		log.Fatalf("Error initializing listener %s: %s", x.Type, err)
 	}
 
-	hc.ports = make(map[net.Addr][]*ServiceMap)
+	// init ports
 	for _, s := range hc.config.Ports {
 		hc.CreatePort(s, l)
 	}
@@ -982,6 +988,8 @@ func (hc *Honeytrap) handle(conn net.Conn) {
 // Stop will stop Honeytrap
 func (hc *Honeytrap) Stop() {
 	hc.profiler.Stop()
-	hc.ui.Close()
+	if hc.ui != nil {
+		hc.ui.Close()
+	}
 	fmt.Println(color.YellowString("Honeytrap stopped."))
 }
