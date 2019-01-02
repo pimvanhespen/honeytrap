@@ -451,35 +451,47 @@ func (v *validata) String() string {
 
 func (v *validata) ToConfig() *config.Config {
 	// Copy default settings (there's no implementation for changes to these settings yet) #TODO
-	result := config.Default
-	result.Listener = v.Config.Listener
-	result.Web = v.Config.Web
-	result.Logging = v.Config.Logging
-	result.MiniDisplay = v.Config.MiniDisplay
+	// copying config because half of the settings will stay the same, and it prevents the need init
+	// toml.MetaData. A toml.MetaData struct cannot be create outside the package (it can, but usage
+	// of underlying maps will retur an exception). Which kames it impossible
+	// to correctly decode later servicespecific stuff on in the Honeytrap...
+	result := v.Config
+	result.Channels = map[string]toml.Primitive{}
+	result.Filters = []toml.Primitive{}
+	result.Ports = []toml.Primitive{}
+	result.Directors = map[string]toml.Primitive{}
+	result.Services = map[string]toml.Primitive{}
 
 	// Copy not excluded channels
 	for _, channel := range v.GetChannels() {
 		result.Channels[channel.Name] = channel.Primitive
 	}
+	//fmt.Println(result.Channels)
+
 	// and filters
 	for _, filter := range v.GetFilters() {
 		result.Filters = append(result.Filters, filter.Primitive)
 	}
+	//fmt.Println(result.Filters)
+
 	// and ports
 	for _, port := range v.GetPorts() {
 		result.Ports = append(result.Ports, port.Primitive)
 	}
+	//fmt.Println(result.Ports)
+
 	// and directors
 	for _, dir := range v.GetDirectors() {
 		result.Directors[dir.Name] = dir.Primitive
 	}
+	//fmt.Println(result.Directors)
+
 	// and finally, services
 	for _, serv := range v.GetServices() {
 		result.Services[serv.Name] = serv.Primitive
 	}
 
-	// return the new config object
-	return &result
+	return result
 }
 
 func strListMatches(a, b []string) (c []string) {
@@ -518,6 +530,7 @@ func Validate(conf *config.Config) *config.Config {
 	// dont check for duplicatres here... This is for a single file
 
 	// LINK: Filter --> channel
+	// LINK: Filter --> Services (If any are defined)
 	for _, filter := range v.GetFilters() {
 		channel := v.GetChannel(filter.Target)
 		if channel == nil {
@@ -526,6 +539,7 @@ func Validate(conf *config.Config) *config.Config {
 			filter.Excluded = true
 			continue
 		}
+
 		// LINK!
 		channel.Filters = append(channel.Filters, filter)
 		filter.channelData = channel
@@ -573,7 +587,7 @@ func Validate(conf *config.Config) *config.Config {
 	// check if services exist (non-blockingfatal for a channel... )
 	// filters with no services are excluded
 	for _, filter := range v.GetFilters() {
-
+		fmt.Println("FilteR", filter.Services)
 		// is this filter filtering services?
 		if len(filter.Meta.Services) == 0 {
 			//no service filtering

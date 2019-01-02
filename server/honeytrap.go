@@ -706,6 +706,8 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	hc.profiler.Start()
 
+	hc.config = validator.Validate(hc.config)
+
 	w, err := web.New(
 		web.WithEventBus(hc.bus),
 		web.WithDataDir(hc.dataDir),
@@ -721,8 +723,6 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	// maybe we can rewrite pushers / channels to use global bus instead
 	bc := pushers.NewBusChannel()
 	hc.bus.Subscribe(bc)
-
-	_ = validator.Validate(hc.config)
 
 	//TODO pimvanhespen: get this map out of here
 	isChannelUsed := make(map[string]bool)
