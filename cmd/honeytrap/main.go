@@ -31,9 +31,12 @@
 package honeytrap
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
 
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -41,6 +44,8 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/honeytrap/honeytrap/cmd"
+	"github.com/honeytrap/honeytrap/config"
+	"github.com/honeytrap/honeytrap/config/validator"
 	"github.com/honeytrap/honeytrap/listener"
 	"github.com/honeytrap/honeytrap/pushers"
 	"github.com/honeytrap/honeytrap/server"
@@ -85,6 +90,8 @@ var globalFlags = []cli.Flag{
 	cli.BoolFlag{Name: "cpu-profile", Usage: "Enable cpu profiler"},
 	cli.BoolFlag{Name: "mem-profile", Usage: "Enable memory profiler"},
 
+	cli.BoolFlag{Name: "validate-config", Usage: "Validate a LOCAL config file"},
+
 	cli.BoolFlag{Name: "list-services", Usage: "List the available services"},
 	cli.BoolFlag{Name: "list-channels", Usage: "List the available channels"},
 	cli.BoolFlag{Name: "list-listeners", Usage: "List the available listeners"},
@@ -123,58 +130,6 @@ func tryConfig(path string) (server.OptionFn, error) {
 }
 
 func serve(c *cli.Context) error {
-	var options []server.OptionFn
-
-	// Honeytrap will search for a config file in these files, in descending priority
-	configCandidates := []string{
-		c.String("config"),
-		"/etc/honeytrap/config.toml",
-		"/etc/honeytrap.toml",
-	}
-
-	successful := false
-	for _, candidate := range configCandidates {
-		fn, err := tryConfig(candidate)
-		if err != nil {
-			log.Error("Failed to read config file %s: %s", candidate, err.Error())
-			continue
-		}
-		log.Debug("Using config file %s\n", candidate)
-		options = append(options, fn)
-		successful = true
-		break
-	}
-	if !successful {
-		return cli.NewExitError("No configuration file found! Check your config (-c).", 1)
-	}
-
-	if d := c.String("data"); d == "" {
-	} else if fn, err := server.WithDataDir(d); err != nil {
-		ec := cli.NewExitError(err.Error(), 1)
-		return ec
-	} else {
-		options = append(options, fn)
-	}
-
-	options = append(options, server.WithToken())
-
-	if c.GlobalBool("cpu-profile") {
-		options = append(options, server.WithCPUProfiler())
-	}
-
-	if c.GlobalBool("mem-profile") {
-		options = append(options, server.WithMemoryProfiler())
-	}
-
-	srvr, err := server.New(
-		options...,
-	)
-
-	if err != nil {
-		ec := cli.NewExitError(err.Error(), 1)
-		return ec
-	}
-
 	// enumerate the available services
 	if c.GlobalBool("list-services") {
 		fmt.Println("services")
@@ -203,6 +158,97 @@ func serve(c *cli.Context) error {
 			fmt.Printf("* %s\n", name)
 		})
 		return nil
+	}
+
+	var options []server.OptionFn
+
+	// Honeytrap will search for a config file in these files, in descending priority
+	configCandidates := []string{
+		c.String("config"),
+		"/etc/honeytrap/config.toml",
+		"/etc/honeytrap.toml",
+	}
+
+	successful := false
+	cn := ""
+	for _, candidate := range configCandidates {
+		cn = candidate
+		fn, err := tryConfig(candidate)
+		if err != nil {
+			log.Error("Failed to read config file %s: %s", candidate, err.Error())
+			continue
+		}
+		log.Debug("Using config file %s\n", candidate)
+		options = append(options, fn)
+		successful = true
+		break
+	}
+	if !successful {
+		return cli.NewExitError("No configuration file found! Check your config (-c).", 1)
+	}
+
+	if c.GlobalBool("validate-config") {
+		u, e := url.Parse(cn)
+		if e != nil {
+			log.Error(e.Error())
+			return nil
+		}
+
+		var data []byte
+
+		if u.Scheme == "http" || u.Scheme == "https" {
+			resp, err := http.Get(u.Path)
+			if err != nil {
+				log.Error(err.Error())
+				return nil
+			}
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				log.Error(err.Error())
+				return nil
+			}
+			data = body
+		} else {
+			contents, err := ioutil.ReadFile(u.Path)
+			if err != nil {
+				log.Error(err.Error())
+				return nil
+			}
+			data = contents
+		}
+
+		conf := &config.Default
+		conf.Load(bytes.NewBuffer(data))
+		validator.Validate(conf)
+		return nil
+	}
+
+	if d := c.String("data"); d == "" {
+	} else if fn, err := server.WithDataDir(d); err != nil {
+		ec := cli.NewExitError(err.Error(), 1)
+		return ec
+	} else {
+		options = append(options, fn)
+	}
+
+	options = append(options, server.WithToken())
+
+	if c.GlobalBool("cpu-profile") {
+		options = append(options, server.WithCPUProfiler())
+	}
+
+	if c.GlobalBool("mem-profile") {
+		options = append(options, server.WithMemoryProfiler())
+	}
+
+	srvr, err := server.New(
+		options...,
+	)
+
+	if err != nil {
+		ec := cli.NewExitError(err.Error(), 1)
+		return ec
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
