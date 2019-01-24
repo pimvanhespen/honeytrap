@@ -3,6 +3,8 @@ package validator
 import (
 	"bytes"
 	"fmt"
+	"net"
+	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -12,6 +14,15 @@ import (
 	"github.com/honeytrap/honeytrap/director"
 	"github.com/honeytrap/honeytrap/pushers"
 	"github.com/honeytrap/honeytrap/services"
+)
+
+type Action int
+
+const (
+	KEEP = iota
+	DISCARD
+	CREATE
+	IGNORE // in case of bad config or ignored newer definition
 )
 
 var log = logging.MustGetLogger("honeytrap/config/validator")
@@ -27,27 +38,49 @@ func parseMetaData(source toml.Primitive, target interface{}, decode DecodeFunc,
 	return success
 }
 
+// PRIVATE structs & methods
+// used for decoding purposes only (just about everything)
 type channelMeta struct {
 	Type string `toml:"type"`
 }
 type channelData struct {
 	toml.Primitive
-	Excluded bool
-	Name     string
-	Meta     *channelMeta
-	Filters  []*filterData
+	Action
+	Name    string
+	Meta    *channelMeta
+	Filters []*filterData
+}
+type Channel struct {
+	Action
+	toml.Primitive
+	Type string
+	Name string
 }
 
 func (c *channelData) Validate() {
 	_, ok := pushers.Get(c.Meta.Type)
 	if !ok {
 		log.Error("Channel %s not supported on platform (%s)", c.Meta.Type, c.Name)
-		c.Excluded = true
+		c.Action = IGNORE
 		return
 	}
 }
 func (c *channelData) String() string {
 	return fmt.Sprintf("Channel[ name: %s, type: %s]", c.Name, c.Meta.Type)
+}
+func (c *channelData) Equals(other *channelData) bool {
+	return c.Name == other.Name
+}
+func (c *channelData) Exclude() {
+	c.Action = IGNORE
+}
+func (c *channelData) Export() Channel {
+	return Channel{
+		Action:    c.Action,
+		Primitive: c.Primitive,
+		Type:      c.Meta.Type,
+		Name:      c.Name,
+	}
 }
 
 type filterMeta struct {
@@ -57,11 +90,33 @@ type filterMeta struct {
 }
 type filterData struct {
 	toml.Primitive
-	Excluded     bool
+	Action
 	Target       string
 	Meta         *filterMeta
 	*channelData                //link
 	Services     []*serviceData //link
+}
+type Filter struct {
+	Action
+	toml.Primitive
+	Target     string
+	Services   []string
+	Categories []string
+}
+
+func strListCmp(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sort.Strings(a)
+	sort.Strings(b)
+
+	for i, item := range a {
+		if item != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *filterData) String() string {
@@ -78,16 +133,44 @@ func (f *filterData) Validate() {
 func (f *filterData) Dump() string {
 	return fmt.Sprintf("target channel: '%s'; config from file: Channels:%v, Services:%v, Categories: %v", f.Target, f.Meta.Channels, f.Meta.Services, f.Meta.Categories)
 }
+func (f *filterData) Equals(other *filterData) bool {
+	if f.Target != other.Target {
+		return false
+	}
+	if !strListCmp(f.Meta.Services, other.Meta.Services) {
+		return false
+	}
+
+	return strListCmp(f.Meta.Categories, other.Meta.Categories)
+}
+func (f *filterData) Exclude() {
+	f.Action = IGNORE
+}
+func (f *filterData) Export() Filter {
+	return Filter{
+		Action:     f.Action,
+		Primitive:  f.Primitive,
+		Target:     f.Target,
+		Services:   f.Meta.Services,
+		Categories: f.Meta.Categories,
+	}
+}
 
 type directorMeta struct {
 	Type string `toml:"type"`
 }
 type directorData struct {
 	toml.Primitive
-	Excluded bool
+	Action
 	Name     string
 	Meta     *directorMeta
 	Services []*serviceData //link
+}
+type Director struct {
+	Action
+	toml.Primitive
+	Name string
+	Type string
 }
 
 func (d *directorData) String() string {
@@ -96,16 +179,30 @@ func (d *directorData) String() string {
 func (d *directorData) Validate() {
 	if "" == d.Meta.Type {
 		log.Error("Type not set for director")
-		d.Excluded = true
+		d.Action = IGNORE
 		return // no need for further checking?
 	}
 	_, ok := director.Get(d.Meta.Type)
 	if !ok {
 		log.Error("Director %s not supported on platform", d.Meta.Type)
-		d.Excluded = true
+		d.Action = IGNORE
 		return
 	}
 	//TODO check if type exists
+}
+func (d *directorData) Equals(other *directorData) bool {
+	return d.Name == other.Name
+}
+func (d *directorData) Exclude() {
+	d.Action = IGNORE
+}
+func (d *directorData) Export() Director {
+	return Director{
+		Action:    d.Action,
+		Primitive: d.Primitive,
+		Name:      d.Name,
+		Type:      d.Meta.Type,
+	}
 }
 
 type serviceMeta struct {
@@ -115,12 +212,19 @@ type serviceMeta struct {
 }
 type serviceData struct {
 	toml.Primitive
-	Excluded bool
-	Meta     *serviceMeta
-	Name     string
+	Action
+	Meta *serviceMeta
+	Name string
 	*directorData
 	Ports   []*portData //link
 	Filters []*filterData
+}
+type Service struct {
+	Action
+	toml.Primitive
+	Type     string
+	Name     string
+	Director string
 }
 
 func (s *serviceData) String() string {
@@ -129,19 +233,34 @@ func (s *serviceData) String() string {
 func (s *serviceData) Validate() {
 	if "" == s.Meta.Type {
 		log.Error("Service type not set for service '%s'", s.Name)
-		s.Excluded = true
+		s.Action = IGNORE
 		return // no need for further checking...
 	}
 
 	_, ok := services.Get(s.Meta.Type)
 	if !ok {
 		log.Error("Service '%s' not supported on platform (%s)", s.Meta.Type, s.Name)
-		s.Excluded = true
+		s.Action = IGNORE
 		return
 	}
 
 	if "" != s.Meta.Port {
 		log.Warning("Configuring ports for services is deprecated. define services for ports instead")
+	}
+}
+func (s *serviceData) Equals(other *serviceData) bool {
+	return s.Name == other.Name
+}
+func (s *serviceData) Exclude() {
+	s.Action = IGNORE
+}
+func (s *serviceData) Export() Service {
+	return Service{
+		Action:    s.Action,
+		Primitive: s.Primitive,
+		Type:      s.Meta.Type,
+		Name:      s.Name,
+		Director:  s.Meta.Director,
 	}
 }
 
@@ -152,9 +271,16 @@ type portMeta struct {
 }
 type portData struct {
 	toml.Primitive
-	Excluded bool
+	Action
 	Meta     *portMeta
 	Services []*serviceData //link
+	Ports    []net.Addr
+}
+type Port struct {
+	Action
+	toml.Primitive
+	Services []string
+	Ports    []net.Addr
 }
 
 func (p *portData) String() string {
@@ -176,37 +302,123 @@ func (p *portData) Validate() {
 		log.Warning("Both \"port\" and \"ports\" were defined, this can be confusing")
 	} else if p.Meta.Port == "" && p.Meta.Ports == nil {
 		log.Error("Neither \"port\" nor \"ports\" were defined")
-		p.Excluded = true
+		p.Action = IGNORE
 		return
+	}
+
+	for _, portStr := range ports {
+		addr, _, _, err := config.ToAddr(portStr)
+		if err != nil {
+			log.Error("Error parsing port string (%s): %s", portStr, err.Error())
+			p.Action = IGNORE
+			return
+		}
+		if addr == nil {
+			log.Error("Failed to bind: addr is nil")
+			p.Action = IGNORE
+			return
+		}
+		p.Ports = append(p.Ports, addr)
 	}
 }
 func (p *portData) Dump() string {
 	return fmt.Sprintf("Port: %v, Ports: %v, services: %v", p.Meta.Port, p.Meta.Ports, p.Meta.Services)
 }
+func (p *portData) Name() string {
+	var ports []string
+	if len(p.Meta.Ports) > 0 {
+		ports = p.Meta.Ports
+	}
+	if len(p.Meta.Port) > 0 {
+		ports = append(ports, p.Meta.Port)
+	}
+	return strings.Join(ports, ",")
+}
+func (p *portData) Overlapping(other *portData) []net.Addr {
+	result := []net.Addr{}
+	for _, local := range p.Ports {
+		for _, ext := range other.Ports {
+			if config.CompareAddr(local, ext) {
+				result = append(result, local)
+			}
+		}
+	}
+	return result
+}
+func (p *portData) Equals(other *portData) bool {
+	return len(p.Overlapping(other)) > 0
+}
+func (p *portData) Exclude() {
+	p.Action = IGNORE
+}
+func (p *portData) Export() Port {
+	return Port{
+		Action:    p.Action,
+		Primitive: p.Primitive,
+		Services:  p.Meta.Services,
+		Ports:     p.Ports,
+	}
+}
 
-type validata struct {
+// The master-strcut, this struct contains all data that's required to validate a <<SINGLE>> config file
+type Validata struct {
 	*config.Config
 	Channels  []*channelData
 	Filters   []*filterData
 	Directors []*directorData
 	Services  []*serviceData
 	Ports     []*portData
+	prepared  bool
 }
 
-func newValidata(cfg *config.Config) *validata {
-	return &validata{
-		Config:    cfg,
-		Channels:  []*channelData{},
-		Filters:   []*filterData{},
-		Directors: []*directorData{},
-		Services:  []*serviceData{},
-		Ports:     []*portData{},
+func newValidata(cfg *config.Config) *Validata {
+	data := &Validata{
+		Config: cfg,
+	}
+	return data
+}
+
+func (v *Validata) Prepare(action Action) {
+	if v.prepared {
+		v.prepareOld(action)
+	} else {
+		v.prepareNew(action)
+	}
+}
+
+func (v *Validata) prepareOld(action Action) {
+	v.Channels = v.GetChannels()
+	for _, x := range v.Channels {
+		x.Action = action
+	}
+
+	v.Filters = v.GetFilters()
+	for _, x := range v.Filters {
+		x.Action = action
+	}
+
+	v.Directors = v.GetDirectors()
+	for _, x := range v.Directors {
+		x.Action = action
+	}
+
+	v.Services = v.GetServices()
+	for _, x := range v.Services {
+		x.Action = action
+	}
+
+	v.Ports = v.GetPorts()
+	for _, x := range v.Ports {
+		x.Action = action
 	}
 }
 
 //Prepare This function can decode channels, services etc.. and store relevant data in a metadata obejcts.
 //It is, indeed, not very pretty.. it'l remains so until golang has generics.
-func (v *validata) Prepare() {
+func (v *Validata) prepareNew(action Action) {
+	// set prepared = true
+	v.prepared = true
+
 	fn := v.Config.PrimitiveDecode
 
 	logErr := func(typ string, err error) {
@@ -223,6 +435,7 @@ func (v *validata) Prepare() {
 			Primitive: primitive,
 			Meta:      &tmp,
 			Name:      key,
+			Action:    action,
 		})
 	}
 
@@ -259,6 +472,7 @@ func (v *validata) Prepare() {
 				Primitive: newPrimitive,
 				Target:    channel,
 				Meta:      &meta,
+				Action:    action,
 			}
 			v.Filters = append(v.Filters, filter)
 		}
@@ -274,6 +488,7 @@ func (v *validata) Prepare() {
 			Primitive: primitive,
 			Meta:      &tmp,
 			Name:      key,
+			Action:    action,
 		})
 	}
 
@@ -287,6 +502,7 @@ func (v *validata) Prepare() {
 			Meta:      &tmp,
 			Name:      key,
 			Primitive: primitive,
+			Action:    action,
 		})
 	}
 
@@ -299,13 +515,14 @@ func (v *validata) Prepare() {
 		v.Ports = append(v.Ports, &portData{
 			Primitive: primitive,
 			Meta:      &tmp,
+			Action:    action,
 		})
 	}
 
 }
 
 // dumps unsued keys in config to log
-func (v *validata) UnusedConfig() {
+func (v *Validata) UnusedConfig() {
 	if len(v.Config.Undecoded()) > 0 {
 		log.Warningf("Unrecognized keys in configuration: %v", v.Config.Undecoded())
 	}
@@ -313,9 +530,9 @@ func (v *validata) UnusedConfig() {
 }
 
 // GetChannel returns the requested Channel object, if the object isn't marked as excluded
-func (v *validata) GetChannel(wanted string) *channelData {
+func (v *Validata) GetChannel(wanted string) *channelData {
 	for _, channel := range v.Channels {
-		if !channel.Excluded && channel.Name == wanted {
+		if !inactiveState(channel.Action) && channel.Name == wanted {
 			return channel
 		}
 	}
@@ -323,9 +540,9 @@ func (v *validata) GetChannel(wanted string) *channelData {
 }
 
 // GetService returns the requested Service object, if the object isn't marked as excluded
-func (v *validata) GetService(wanted string) *serviceData {
+func (v *Validata) GetService(wanted string) *serviceData {
 	for _, service := range v.Services {
-		if !service.Excluded && service.Name == wanted {
+		if !inactiveState(service.Action) && service.Name == wanted {
 			return service
 		}
 	}
@@ -333,9 +550,9 @@ func (v *validata) GetService(wanted string) *serviceData {
 }
 
 // GetDirector returns the requested object, if the object isnt marked as excluded
-func (v *validata) GetDirector(wanted string) *directorData {
+func (v *Validata) GetDirector(wanted string) *directorData {
 	for _, director := range v.Directors {
-		if !director.Excluded && director.Meta.Type == wanted {
+		if !inactiveState(director.Action) && director.Meta.Type == wanted {
 			return director
 		}
 	}
@@ -343,9 +560,9 @@ func (v *validata) GetDirector(wanted string) *directorData {
 }
 
 // GetChannels returns all channels that aren't marked as excluded
-func (v *validata) GetChannels() (result []*channelData) {
+func (v *Validata) GetChannels() (result []*channelData) {
 	for _, channel := range v.Channels {
-		if !channel.Excluded {
+		if !inactiveState(channel.Action) {
 			result = append(result, channel)
 		}
 	}
@@ -353,9 +570,9 @@ func (v *validata) GetChannels() (result []*channelData) {
 }
 
 // GetFilters returns all filterss that aren't marked as excluded
-func (v *validata) GetFilters() (result []*filterData) {
+func (v *Validata) GetFilters() (result []*filterData) {
 	for _, item := range v.Filters {
-		if !item.Excluded {
+		if !inactiveState(item.Action) {
 			result = append(result, item)
 		}
 	}
@@ -363,9 +580,9 @@ func (v *validata) GetFilters() (result []*filterData) {
 }
 
 // GetDirectors returns all directors that aren't marked as excluded
-func (v *validata) GetDirectors() (result []*directorData) {
+func (v *Validata) GetDirectors() (result []*directorData) {
 	for _, item := range v.Directors {
-		if !item.Excluded {
+		if !inactiveState(item.Action) {
 			result = append(result, item)
 		}
 	}
@@ -373,9 +590,9 @@ func (v *validata) GetDirectors() (result []*directorData) {
 }
 
 // GetServices returns all services that aren't marked as excluded
-func (v *validata) GetServices() (result []*serviceData) {
+func (v *Validata) GetServices() (result []*serviceData) {
 	for _, item := range v.Services {
-		if !item.Excluded {
+		if !inactiveState(item.Action) {
 			result = append(result, item)
 		}
 	}
@@ -383,9 +600,9 @@ func (v *validata) GetServices() (result []*serviceData) {
 }
 
 // GetPorts returns all ports that aren't marked as excluded
-func (v *validata) GetPorts() (result []*portData) {
+func (v *Validata) GetPorts() (result []*portData) {
 	for _, item := range v.Ports {
-		if !item.Excluded {
+		if !inactiveState(item.Action) {
 			result = append(result, item)
 		}
 	}
@@ -394,7 +611,7 @@ func (v *validata) GetPorts() (result []*portData) {
 
 // SelfValidate this method call the 'Validate()' method on all of its objects (Services filters, etc.)
 //Excludes all objects that find themselves invalid. DOES NOT CHECK LINKS BETWEEN OBJECTS!
-func (v *validata) SelfValidate() {
+func (v *Validata) SelfValidate() {
 	for _, item := range v.GetChannels() {
 		item.Validate()
 	}
@@ -414,11 +631,11 @@ func (v *validata) SelfValidate() {
 
 // Copy Returnsa copy of the original 'validata'-object conting only the valid data
 //object marked as excluded will be excluded accordingly
-func (v *validata) Copy(excluded bool) *validata {
+func (v *Validata) Copy(excluded bool) *Validata {
 	if excluded {
 		return nil // not supported yet
 	}
-	return &validata{
+	return &Validata{
 		Channels:  v.GetChannels(),
 		Filters:   v.GetFilters(),
 		Directors: v.GetDirectors(),
@@ -428,7 +645,7 @@ func (v *validata) Copy(excluded bool) *validata {
 }
 
 //String returns a string representations of the object
-func (v *validata) String() string {
+func (v *Validata) String() string {
 	result := "Validata[\n"
 	for _, x := range v.GetChannels() {
 		result += "\t" + x.String() + "\n"
@@ -449,7 +666,8 @@ func (v *validata) String() string {
 	return result
 }
 
-func (v *validata) ToConfig() *config.Config {
+//ToConfig builds a config.Config object from the valid config items
+func (v *Validata) ToConfig() *config.Config {
 	// Copy default settings (there's no implementation for changes to these settings yet) #TODO
 	// copying config because half of the settings will stay the same, and it prevents the need init
 	// toml.MetaData. A toml.MetaData struct cannot be create outside the package (it can, but usage
@@ -494,49 +712,200 @@ func (v *validata) ToConfig() *config.Config {
 	return result
 }
 
-func strListMatches(a, b []string) (c []string) {
-	for _, aa := range a {
-		for _, bb := range b {
-			if aa == bb {
-				c = append(c, aa)
+func (v *Validata) ConfigSpec() ConfigSpec {
+	channels := make([]Channel, len(v.Channels))
+	for i, x := range v.Channels {
+		channels[i] = x.Export()
+	}
+	filters := make([]Filter, len(v.Filters))
+	for i, x := range v.Filters {
+		filters[i] = x.Export()
+	}
+	dirs := make([]Director, len(v.Directors))
+	for i, x := range v.Directors {
+		dirs[i] = x.Export()
+	}
+	services := make([]Service, len(v.Services))
+	for i, x := range v.Services {
+		services[i] = x.Export()
+	}
+	ports := make([]Port, len(v.Ports))
+	for i, x := range v.Ports {
+		ports[i] = x.Export()
+	}
+	return ConfigSpec{
+		Config:    v.ToConfig(),
+		Channels:  channels,
+		Filters:   filters,
+		Directors: dirs,
+		Services:  services,
+		Ports:     ports,
+	}
+}
+
+type ConfigSpec struct {
+	*config.Config //for overwriting the known config
+	Channels       []Channel
+	Services       []Service
+	Filters        []Filter
+	Directors      []Director
+	Ports          []Port
+}
+
+func inactiveState(action Action) bool {
+	switch action {
+	case IGNORE, DISCARD:
+		return true
+	default:
+		return false
+	}
+}
+
+func Merge(v1, v2 *Validata, ignoreNewerDefinition bool) *Validata {
+	//TODO use ignore newer definition
+	v1.Channels = append(v1.Channels, v2.Channels...)
+	v1.Filters = append(v1.Filters, v2.Filters...)
+	v1.Directors = append(v1.Directors, v2.Directors...)
+	v1.Services = append(v1.Services, v2.Services...)
+	v1.Ports = append(v1.Ports, v2.Ports...)
+
+	//channels
+	for i, channel := range v1.Channels {
+		for j := i + 1; j < len(v1.Channels); j++ {
+			option := v1.Channels[j]
+			if inactiveState(option.Action) {
+				continue
+			}
+			if channel.Equals(option) {
+				if ignoreNewerDefinition {
+					option.Exclude()
+				} else {
+					channel.Action = DISCARD
+				}
 			}
 		}
 	}
-	return
-}
+	// repeat for other stuff
+	// TODO switch to datastructure?!!
 
-func strInList(str string, list []string) bool {
-	for _, item := range list {
-		if str == item {
-			return true
+	for i, filter := range v1.Filters {
+		for j := i + 1; j < len(v1.Filters); j++ {
+			option := v1.Filters[j]
+			if inactiveState(option.Action) {
+				continue
+			}
+			if filter.Equals(option) {
+				if ignoreNewerDefinition {
+					option.Exclude()
+				} else {
+					filter.Action = DISCARD
+				}
+			}
 		}
 	}
-	return false
+
+	for i, dir := range v1.Directors {
+		for j := i + 1; j < len(v1.Directors); j++ {
+			option := v1.Directors[j]
+			if inactiveState(option.Action) {
+				continue
+			}
+			if dir.Equals(option) {
+				if ignoreNewerDefinition {
+					option.Exclude()
+				} else {
+					dir.Action = DISCARD
+				}
+			}
+		}
+	}
+
+	for i, service := range v1.Services {
+		for j := i + 1; j < len(v1.Services); j++ {
+			option := v1.Services[j]
+			if inactiveState(option.Action) {
+				continue
+			}
+			if service.Equals(option) {
+				if ignoreNewerDefinition {
+					option.Exclude()
+				} else {
+					service.Action = DISCARD
+				}
+			}
+		}
+	}
+
+	for i, port := range v1.Ports {
+		for j := i + 1; j < len(v1.Ports); j++ {
+			option := v1.Ports[j]
+			if inactiveState(option.Action) {
+				continue
+			}
+			if port.Equals(option) {
+				if ignoreNewerDefinition {
+					option.Exclude()
+				} else {
+					port.Action = DISCARD
+				}
+			}
+		}
+	}
+	return v1
 }
 
-// Validate validates a single config file. do not use this for comparisons...
-func Validate(conf *config.Config) *config.Config {
+func (v Validator) Validate(current *Validata, update *config.Config) (*Validata, error) {
 	log.Info("Validating configuration... Validating Channels, Filters, Directors, Services and Ports.")
 
-	v := newValidata(conf)
+	var prepared *Validata
 
-	// load data into a validation object.
-	v.Prepare()
+	if current != nil && update != nil {
+		if v.RemoveExisting {
+			current.Prepare(DISCARD)
+		} else {
+			current.Prepare(KEEP)
+		}
+		next := newValidata(update)
+		next.Prepare(CREATE)
+		prepared = Merge(current, next, v.Replace)
+
+	} else if current != nil {
+		//this is no update
+		return current, nil
+	} else if update != nil {
+		prepared = newValidata(update)
+		prepared.Prepare(CREATE) // ussume it's new config
+	} else {
+		return nil, fmt.Errorf("No config supplied.")
+	}
+
+	return v.validate(prepared)
+}
+
+type Validator struct {
+	Replace        bool
+	RemoveExisting bool
+}
+
+//TODO split this function in a private validation, and a public callable function (allows different function signatures (e.g. one file, or two, etc.))
+// Validate validates a single config file. do not use this for comparisons...
+func (v Validator) validate(prepared *Validata) (*Validata, error) {
+
 	// all items should self validate (e.g. is their private config o.k.)
 	// this check ignores links to other objects
-	v.SelfValidate()
+	prepared.SelfValidate()
 
 	// Duplicates?
 	// dont check for duplicatres here... This is for a single file
 
 	// LINK: Filter --> channel
 	// LINK: Filter --> Services (If any are defined)
-	for _, filter := range v.GetFilters() {
-		channel := v.GetChannel(filter.Target)
+	for _, filter := range prepared.GetFilters() {
+		channel := prepared.GetChannel(filter.Target)
 		if channel == nil {
 			// ignore this filter, it won't write to anything. It's useless.
 			log.Error("Could not find channel '%s' for filter", filter.Target)
-			filter.Excluded = true
+			filter.Action = IGNORE
 			continue
 		}
 
@@ -546,10 +915,10 @@ func Validate(conf *config.Config) *config.Config {
 	}
 
 	// check for channels with no filter (unused channels)
-	for _, channel := range v.GetChannels() {
+	for _, channel := range prepared.GetChannels() {
 		if 0 == len(channel.Filters) {
 			log.Error("No filters configured for channel '%s', type: '%s'", channel.Name, channel.Meta.Type)
-			channel.Excluded = true
+			channel.Action = IGNORE
 			continue
 		}
 	}
@@ -557,16 +926,16 @@ func Validate(conf *config.Config) *config.Config {
 	// LINK: Service --> director
 	// If a service cannot be linked to any director, it should not be used
 	// if a service has a direc specified, but cannot be linked to it, ignore the service definition
-	for _, service := range v.GetServices() {
+	for _, service := range prepared.GetServices() {
 		directorName := service.Meta.Director
 		if "" == directorName {
 			continue // no director set, do not check if director exists
 		}
 
-		d := v.GetDirector(directorName)
+		d := prepared.GetDirector(directorName)
 		if nil == d {
 			log.Error("No director of type '%s' found for service '%s'", directorName, service.Name)
-			service.Excluded = true
+			service.Action = IGNORE
 			continue //ignore this service...
 		}
 		// LINK!
@@ -575,10 +944,10 @@ func Validate(conf *config.Config) *config.Config {
 	}
 
 	// check for unused directors
-	for _, d := range v.GetDirectors() {
+	for _, d := range prepared.GetDirectors() {
 		if 0 == len(d.Services) {
 			log.Error("Director '%s' unused, excluding it from config", d.Meta.Type)
-			d.Excluded = true
+			d.Action = IGNORE
 			continue
 		}
 	}
@@ -586,15 +955,14 @@ func Validate(conf *config.Config) *config.Config {
 	// LINK: Filter --> Services
 	// check if services exist (non-blockingfatal for a channel... )
 	// filters with no services are excluded
-	for _, filter := range v.GetFilters() {
-		fmt.Println("FilteR", filter.Services)
+	for _, filter := range prepared.GetFilters() {
 		// is this filter filtering services?
 		if len(filter.Meta.Services) == 0 {
 			//no service filtering
 			continue
 		}
 		for _, name := range filter.Meta.Services {
-			service := v.GetService(name)
+			service := prepared.GetService(name)
 			if service == nil {
 				log.Warning("Unrecognized service '%s' for filter", name)
 				continue
@@ -606,23 +974,50 @@ func Validate(conf *config.Config) *config.Config {
 		}
 		if 0 == len(filter.Services) {
 			log.Error("No services found for filter with config: %s", filter.Dump())
-			filter.Excluded = true
+			filter.Action = IGNORE
+		}
+	}
+
+	// CHECK: all ports unique?
+	ports := prepared.GetPorts()
+	for i := 0; i < len(ports)-1; i++ {
+		porti := ports[i]
+
+		//TODO check if this code is obsolete
+		//	if porti.Action == IGNORE {
+		//		continue
+		//}
+		for j := i + 1; j < len(ports); j++ {
+			portj := ports[j]
+			//TODO check if code is obsolete
+			//if portj.Action == IGNORE {
+			//	continue
+			//}
+			if overlap := porti.Overlapping(portj); len(overlap) != 0 {
+				prts := []string{}
+				for _, x := range overlap {
+					prts = append(prts, fmt.Sprintf("%s%s", x.Network(), x.String()))
+				}
+				log.Error("Port(s) already defined / in use. Was it defined twice? [%s]", strings.Join(prts, ";"))
+				portj.Action = IGNORE
+			}
 		}
 	}
 
 	// LINK: Port --> Service
 	// matches services to port IF the services have not been excluded for config errors
-	for _, port := range v.GetPorts() {
+	for _, port := range prepared.GetPorts() {
+
 		s := port.Meta.Services
 		//log.Infof("Checking port %s", port.Dump())
 		if 0 == len(s) {
 			log.Error("No services configured for port with config: %s", port.Dump())
-			port.Excluded = true
+			port.Action = IGNORE
 			continue
 		}
 
 		for _, serviceName := range s {
-			service := v.GetService(serviceName)
+			service := prepared.GetService(serviceName)
 			if nil == service {
 				log.Warning("Service '%s' not found for port", serviceName)
 				continue
@@ -635,21 +1030,22 @@ func Validate(conf *config.Config) *config.Config {
 		// check if there are any services connected to the port
 		if 0 == len(port.Services) {
 			// no services connected
-			log.Error("No usable services found for port. wanted: %v. Did a service fail to configure?", port.Meta.Services)
-			port.Excluded = true
+			log.Error("Port %s has no valid services, wanted: %v. Did a service fail to configure?", port.Name(), port.Meta.Services)
+			port.Action = IGNORE
 			continue
 		}
 	}
 
 	// Check if all services are assinged to ports
-	for _, service := range v.GetServices() {
+	for _, service := range prepared.GetServices() {
 		if 0 == len(service.Ports) {
 			log.Error("No ports configured for service '%s'", service.Name)
-			service.Excluded = true
+			service.Action = IGNORE
 		}
 	}
 
-	//NOTE: for compare: Check for outside links -- NOT HERE
-	v.UnusedConfig()
-	return v.ToConfig()
+	//TODO: for compare: Check for links to current config -- NOT HERE
+	prepared.UnusedConfig()
+
+	return prepared, nil
 }

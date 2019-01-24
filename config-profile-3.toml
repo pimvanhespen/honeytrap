@@ -1,0 +1,16 @@
+### All services are under honeytrap/services ###
+
+[service.ldap-3]
+type="ldap"
+credentials=["admin:admin", "root:root"]
+naming-contexts=[ "dc=example,dc=com", "dc=ad,dc=myserver,dc=com" ]
+supported-ldap-version=[ "3" ]
+#supported-extension=[ "1.3.6.1.4.1.1466.20037" ]
+vendor-name=[ "HT Directory Server" ]
+vendor-version=[ "0.1.0.0" ]
+description=[ "Directory Server" ]
+objectclass=[ "dcObject", "organization" ]
+
+[[port]]
+port="tcp/1111"
+services=["ldap-3"]

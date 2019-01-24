@@ -31,7 +31,10 @@
 package config
 
 import (
+	"fmt"
+	"net"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -90,4 +93,76 @@ func MakeDuration(target string, def uint64) time.Duration {
 		return time.Duration(dur) * time.Second
 	}
 
+}
+
+// Addr, proto, port, error
+func ToAddr(input string) (net.Addr, string, int, error) {
+	parts := strings.Split(input, "/")
+
+	if len(parts) != 2 {
+		return nil, "", 0, fmt.Errorf("wrong format (needs to be \"protocol/(host:)port\")")
+	}
+
+	proto := parts[0]
+
+	host, port, err := net.SplitHostPort(parts[1])
+	if err != nil {
+		port = parts[1]
+	}
+
+	portUint16, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("error parsing port value: %s", err.Error())
+	}
+
+	switch proto {
+	case "tcp":
+		addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+		return addr, proto, int(portUint16), err
+	case "udp":
+		addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
+		return addr, proto, int(portUint16), err
+	default:
+		return nil, "", 0, fmt.Errorf("unknown protocol %s", proto)
+	}
+}
+
+func CompareAddr(addr1 net.Addr, addr2 net.Addr) bool {
+	if ta1, ok := addr1.(*net.TCPAddr); ok {
+		ta2, ok := addr2.(*net.TCPAddr)
+		if !ok {
+			return false
+		}
+
+		if ta1.Port != ta2.Port {
+			return false
+		}
+
+		if ta1.IP == nil {
+		} else if ta2.IP == nil {
+		} else if !ta1.IP.Equal(ta2.IP) {
+			return false
+		}
+
+		return true
+	} else if ua1, ok := addr1.(*net.UDPAddr); ok {
+		ua2, ok := addr2.(*net.UDPAddr)
+		if !ok {
+			return false
+		}
+
+		if ua1.Port != ua2.Port {
+			return false
+		}
+
+		if ua1.IP == nil {
+		} else if ua2.IP == nil {
+		} else if !ua1.IP.Equal(ua2.IP) {
+			return false
+		}
+
+		return true
+	}
+
+	return false
 }

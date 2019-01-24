@@ -31,11 +31,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -124,6 +126,10 @@ var log = logging.MustGetLogger("honeytrap/server")
 type Honeytrap struct {
 	config *config.Config
 
+	State
+
+	stats map[string]int
+
 	profiler profiler.Profiler
 
 	// TODO(nl5887): rename to bus, should we encapsulate this?
@@ -142,6 +148,11 @@ type Honeytrap struct {
 	channels  map[string]pushers.Channel
 
 	ui *userinterface.MiniDisplay
+
+	listnr listener.Listener
+
+	//TODO define somewhere else. Keep for now
+	svNode *node.Link
 }
 
 // New returns a new instance of a Honeytrap struct.
@@ -161,7 +172,11 @@ func New(options ...OptionFn) (*Honeytrap, error) {
 		services:  make(map[string]*ServiceMap),
 		channels:  make(map[string]pushers.Channel),
 		directors: map[string]director.Director{},
+		stats:     map[string]int{},
 	}
+
+	h.stats["received"] = 0
+	h.stats["handled"] = 0
 
 	for _, fn := range options {
 		if err := fn(h); err != nil {
@@ -364,172 +379,182 @@ func compareAddr(addr1 net.Addr, addr2 net.Addr) bool {
 	return false
 }
 
-func (hc *Honeytrap) CreateChannel(key string, channelConfig toml.Primitive) pushers.Channel {
-	x := struct {
-		Type string `toml:"type"`
-	}{}
-
-	if err := hc.config.PrimitiveDecode(channelConfig, &x); err != nil {
-		log.Error("Error parsing configuration of channel: %s", err.Error())
-		return nil
-	}
-
-	channelType := x.Type
-	if channelType == "" {
-		log.Error("Error parsing configuration of channel %s: type not set", key)
-		return nil
-	}
-
-	channelFunc, ok := pushers.Get(channelType)
+func (hc *Honeytrap) CreateChannel(name, typ string, channelConfig toml.Primitive) error {
+	channelFunc, ok := pushers.Get(typ)
 	if !ok {
-		log.Error("Channel %s not supported on platform (%s)", channelType, key)
-		return nil
+		return fmt.Errorf("Failed to create channel %s", typ)
 	}
 	channel, err := channelFunc(
 		pushers.WithConfig(channelConfig, hc.config),
 	)
 	if err != nil {
-		log.Fatalf("Error initializing channel %s(%s): %s", key, channelType, err)
-		return nil
+		return fmt.Errorf("Error initializing channel %s(%s): %s", name, typ, err)
 	}
 
-	return channel
+	hc.channels[name] = channel
+	log.Infof("Configured channel %s(%s)", name, typ)
+	return nil
 }
-
-func (hc *Honeytrap) CreatePort(s toml.Primitive, l listener.Listener) {
-
-	x := struct {
-		Port     string   `toml:"port"`
-		Ports    []string `toml:"ports"`
-		Services []string `toml:"services"`
-	}{}
-
-	if err := hc.config.PrimitiveDecode(s, &x); err != nil {
-		log.Error("Error parsing configuration of generic ports: %s", err.Error())
-		return
+func (hc *Honeytrap) CreateFilter(target string, cats, svcs []string, conf toml.Primitive) error {
+	channel, ok := hc.channels[target]
+	if !ok {
+		return fmt.Errorf("Could not find channel %s for filter", target)
 	}
 
-	var ports []string
-	if x.Ports != nil {
-		ports = x.Ports
-	}
-	if x.Port != "" {
-		ports = append(ports, x.Port)
-	}
-	if x.Port != "" && x.Ports != nil {
-		log.Warning("Both \"port\" and \"ports\" were defined, this can be confusing")
-	} else if x.Port == "" && x.Ports == nil {
-		log.Error("Neither \"port\" nor \"ports\" were defined")
-		return
+	channel = pushers.TokenChannel(channel, hc.token)
+
+	if len(cats) != 0 {
+		channel = pushers.FilterChannel(channel, pushers.RegexFilterFunc("category", cats))
 	}
 
-	if len(x.Services) == 0 {
-		log.Warning("No services defined for port(s) " + strings.Join(ports, ", "))
+	if len(svcs) != 0 {
+		channel = pushers.FilterChannel(channel, pushers.RegexFilterFunc("service", svcs))
 	}
 
-	for _, portStr := range ports {
-		addr, _, _, err := ToAddr(portStr)
-		if err != nil {
-			log.Error("Error parsing port string: %s", err.Error())
-			continue
-		}
-		if addr == nil {
-			log.Error("Failed to bind: addr is nil")
-			continue
-		}
-
-		// Get the services from their names
-		var servicePtrs []*ServiceMap
-		for _, serviceName := range x.Services {
-			ptr, ok := hc.services[serviceName]
-			if !ok {
-				log.Error("Unknown service '%s' for port %s", serviceName, portStr)
-				continue
-			}
-			servicePtrs = append(servicePtrs, ptr)
-		}
-		if len(servicePtrs) == 0 {
-			log.Errorf("Port %s has no valid services, it won't be listened on", portStr)
-			continue
-		}
-
-		found := false
-		for k, _ := range hc.ports {
-			if !compareAddr(k, addr) {
-				continue
-			}
-
-			found = true
-		}
-
-		if found {
-			log.Error("Port %s was already defined, ignoring the newer definition", portStr)
-			continue
-		}
-
-		hc.ports[addr] = servicePtrs
-
-		a, ok := l.(listener.AddAddresser)
-		if !ok {
-			log.Error("Listener error")
-			continue
-		}
-		a.AddAddress(addr)
-
-		//TODO Pim van Hespen: display this after it is check the port has services
-		log.Infof("Configured port %s/%s", addr.Network(), addr.String())
+	if err := hc.bus.Subscribe(channel); err != nil {
+		return fmt.Errorf("Could not add channel %s to bus: %s", target, err.Error())
 	}
 
+	log.Infof("Added filter (from channel: %s) to bus", target)
+	return nil
 }
-
-func (hc *Honeytrap) CreateService(key string, s toml.Primitive) *ServiceMap {
-	x := struct {
-		Type     string `toml:"type"`
-		Director string `toml:"director"`
-		Port     string `toml:"port"`
-	}{}
-
-	if err := hc.config.PrimitiveDecode(s, &x); err != nil {
-		log.Error("Error parsing configuration of service %s: %s", key, err.Error())
-		return nil
+func (hc *Honeytrap) CreateDirector(tp, key string, conf toml.Primitive) error {
+	directorFunc, _ := director.Get(tp)
+	d, err := directorFunc(
+		director.WithChannel(hc.bus),
+		director.WithConfig(conf, hc.config),
+	)
+	if err != nil {
+		return fmt.Errorf("Error initializing director %s(%s): %s", key, tp, err)
 	}
-
-	if x.Port != "" {
-		log.Error("Ports in services are deprecated, add services to ports instead")
-		return nil
-	}
-
+	hc.directors[key] = d
+	return nil
+}
+func (hc *Honeytrap) CreateService(key, serviceType, dir string, s toml.Primitive) error {
 	// individual configuration per service
 	options := []services.ServicerFunc{
 		services.WithChannel(hc.bus),
 		services.WithConfig(s, hc.config),
 	}
 
-	if x.Director == "" {
-	} else if d, ok := hc.directors[x.Director]; ok {
+	if dir == "" {
+	} else if d, ok := hc.directors[dir]; ok {
 		options = append(options, services.WithDirector(d))
 	} else {
-		log.Error(color.RedString("Could not find director=%s for service=%s. Enabled directors: %s", x.Director, key, strings.Join(director.GetAvailableDirectorNames(), ", ")))
-		return nil
+		return fmt.Errorf(color.RedString("Could not find director=%s for service=%s. Enabled directors: %s", dir, key, strings.Join(director.GetAvailableDirectorNames(), ", ")))
 	}
 
-	fn, ok := services.Get(x.Type)
+	fn, ok := services.Get(serviceType)
 	if !ok {
-		log.Error(color.RedString("Could not find type %s for service %s", x.Type, key))
-		return nil
+		return fmt.Errorf(color.RedString("Could not find type %s for service %s", serviceType, key))
 	}
 
 	service := fn(options...)
-	return &ServiceMap{
+	hc.services[key] = &ServiceMap{
 		Service: service,
 		Name:    key,
-		Type:    x.Type,
+		Type:    serviceType,
+	}
+	log.Infof("Configured service (%s)", key) // x.Type removed
+	return nil
+}
+func (hc *Honeytrap) CreatePort(ports []net.Addr, services []string) error {
+	servicePtrs := []*ServiceMap{}
+
+	for _, serviceName := range services {
+		ptr, ok := hc.services[serviceName]
+		//NOTE: implemented!
+		if !ok {
+			return fmt.Errorf("Unknown service '%s' for port %v", serviceName, ports)
+		}
+		servicePtrs = append(servicePtrs, ptr)
+	}
+
+	for _, portAddr := range ports {
+
+		hc.ports[portAddr] = servicePtrs
+
+		a, ok := hc.listnr.(listener.AddAddresser)
+		if !ok {
+			return fmt.Errorf("Listener error")
+		}
+		a.AddAddress(portAddr)
+
+		log.Infof("Configured port %s/%s", portAddr.Network(), portAddr.String())
+	}
+
+	return nil // execution succes, no errors!
+}
+
+//TODO REMOVE THIS< CHANGE IT< WHAT EVER. IT SHOULDNT BE HERE!
+func (hc *Honeytrap) PopulateServicesNode() {
+	fmt.Println(hc.svNode)
+	fmt.Println(*hc.svNode)
+
+	servicesNode := hc.svNode
+	if servicesNode == nil {
+		panic("NIL@@@")
+	}
+	//TODO change this, children are not unlinked.
+	for _, x := range servicesNode.Children {
+		x.SetParent(nil)
+	}
+	servicesNode.Children = []node.Node{}
+	//	fmt.Println(*servicesNode)
+	//	fmt.Println(hc.ports)
+	for port, servicemaps := range hc.ports {
+		for _, servicemap := range servicemaps {
+			n := &node.Link{
+				Name: (servicemap).Name,
+				//Parent: servicesNode,
+			}
+			servicesNode.AddChild(n)
+
+			split := strings.Split(port.String(), ":")
+			portnr := split[len(split)-1]
+			portstring := fmt.Sprintf("%s/%s", port.Network(), portnr)
+
+			dataChild := &node.Data{
+				Name: "Port",
+				//Parent:  n,
+				DataSrc: &node.MockDataSource{portstring},
+				Width:   16, //TODO fix this!
+			}
+			n.AddChild(dataChild)
+
+			/*
+				action := &node.Action{
+					Name: "Disable Service",
+					//Parent: n,
+				}
+				n.AddChild(action)
+
+				action.Action = &node.ExecuteActionType{
+					Execute: func() {
+						//TODO ugly. To be fixed later
+						if action.Name == "Disable Service" {
+							action.Name = "Enable Service"
+						} else {
+							action.Name = "Disable Service"
+						}
+						hc.bus.Send(event.New(
+							event.Sensor("honeytrap"),
+							event.Category("configuration"),
+							event.Service((servicemap).Type),
+							//TODO: Switch To Specific :ENABLE / :DISABLE
+							event.Type("SERVICE:TOGGLE"),
+						))
+					},
+				}*/
+		}
 	}
 }
 
 func (hc *Honeytrap) CreateMiniDisplay() {
 	encodedScreen := hc.config.MiniDisplay["screen"]
 	tomlButton := hc.config.MiniDisplay["button"]
+
+	//fmt.Println("dsiplay config:\t", hc.config.MiniDisplay)
 
 	typeStruct := struct {
 		Type string `toml:"type"`
@@ -593,66 +618,26 @@ func (hc *Honeytrap) CreateMiniDisplay() {
 		DataSrc: &node.MockDataSource{hc.token},
 		Width:   screen.Width(),
 	}
-	root.Children = append(root.Children, tokenData)
+	root.AddChild(tokenData)
 
 	//services
 	servicesNode := &node.Link{
 		Name:   "Services",
 		Parent: root,
 	}
-	root.Children = append(root.Children, servicesNode)
+	root.AddChild(servicesNode)
 
 	// should be dervied from the config manager
 	// ie
-	/*for _, servicemap := range hc.configManager.Services() {
-		// do nothing... for now
-		fmt.Println(servicemap)
-	}*/
-	for port, servicemaps := range hc.ports {
-		for _, servicemap := range servicemaps {
-			n := &node.Link{
-				Name: (servicemap).Name,
-				//Parent: servicesNode,
-			}
-			servicesNode.AddChild(n)
+	//for _, servicemap := range hc.configManager.Services() {
+	//	// do nothing... for now
+	//	fmt.Println(servicemap)
+	//}
 
-			split := strings.Split(port.String(), ":")
-			portnr := split[len(split)-1]
-			portstring := fmt.Sprintf("%s/%s", port.Network(), portnr)
+	hc.svNode = servicesNode
 
-			dataChild := &node.Data{
-				Name: "Port",
-				//Parent:  n,
-				DataSrc: &node.MockDataSource{portstring},
-				Width:   screen.Width(),
-			}
-			n.AddChild(dataChild)
+	hc.PopulateServicesNode()
 
-			action := &node.Action{
-				Name: "Disable Service",
-				//Parent: n,
-			}
-			n.AddChild(action)
-
-			action.Action = &node.ExecuteActionType{
-				Execute: func() {
-					//TODO ugly. To be fixed later
-					if action.Name == "Disable Service" {
-						action.Name = "Enable Service"
-					} else {
-						action.Name = "Disable Service"
-					}
-					hc.bus.Send(event.New(
-						event.Sensor("honeytrap"),
-						event.Category("configuration"),
-						event.Service((servicemap).Type),
-						//TODO: Switch To Specific :ENABLE / :DISABLE
-						event.Type("SERVICE:TOGGLE"),
-					))
-				},
-			}
-		}
-	}
 	//TODO: make this an issue on repo
 	resp, err := http.Get("https://api.ipify.org")
 
@@ -672,16 +657,411 @@ func (hc *Honeytrap) CreateMiniDisplay() {
 		DataSrc: &node.MockDataSource{ipaddr},
 		Width:   screen.Width(),
 	}
-	root.Children = append(root.Children, ipaddrData)
+	root.AddChild(ipaddrData)
 
 	// init ui
 	hc.ui = userinterface.New(screen, buttonhandler, root)
+
+	profileSelection := &node.Link{
+		Name: "Select Profile",
+	}
+
+	for i := 1; i <= 2; i++ {
+		profile := &node.Action{
+			Name: fmt.Sprintf("Profile %v", i),
+			Action: &node.ExecuteActionType{
+				Execute: func() {
+					hc.bus.Send(event.New(
+						event.Sensor("honeytrap"),
+						event.Category("configuration"),
+						event.Type("HONEYTRAP:OVERWRITE"),
+						event.Custom("file", fmt.Sprintf("./config-profile-%v.toml", i)),
+					))
+				},
+			},
+		}
+		profileSelection.AddChild(profile)
+	}
+	root.AddChild(profileSelection)
 
 	go func() {
 		userinterface.WelcomeScreenBee(hc.ui.Display)
 		time.Sleep(1 * time.Second)
 		hc.ui.Refresh()
 	}()
+}
+
+type ConfigManager struct {
+	*Honeytrap
+	*validator.Validata
+	start chan chan chan struct{}
+	*logging.Logger
+}
+
+var configlogger = logging.MustGetLogger("honeytrap/config/manager")
+
+func NewConfigManager(subject *Honeytrap) *ConfigManager {
+	manager := &ConfigManager{
+		Honeytrap: subject,
+		start:     make(chan chan chan struct{}, 1), //TODO remove the channelception
+		Logger:    configlogger,
+	}
+	return manager
+}
+
+type ConfigFunc func(*Honeytrap) error
+
+func createChannel(c validator.Channel) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return h.CreateChannel(c.Name, c.Type, c.Primitive)
+	}
+}
+func removeChannel(c validator.Channel) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return fmt.Errorf("removeChannel not implemented")
+	}
+}
+func channelActions(specs []validator.Channel) (add, remove []ConfigFunc) {
+	for _, channel := range specs {
+		switch channel.Action {
+		case validator.IGNORE, validator.KEEP:
+			// do nothing
+		case validator.DISCARD:
+			remove = append(remove, removeChannel(channel))
+		case validator.CREATE:
+			add = append(add, createChannel(channel))
+		default:
+			configlogger.Error("Error while building change spec: Unknown action type: %v", channel.Action)
+		}
+	}
+	return
+}
+
+func createFilter(filter validator.Filter) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return h.CreateFilter(filter.Target, filter.Categories, filter.Services, filter.Primitive)
+	}
+}
+func removeFilter(fiter validator.Filter) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return fmt.Errorf("remove filter not implemented")
+	}
+}
+func filterActions(specs []validator.Filter) (add, remove []ConfigFunc) {
+	for _, filter := range specs {
+		switch filter.Action {
+		case validator.IGNORE, validator.KEEP:
+			// do nothing
+		case validator.DISCARD:
+			remove = append(remove, removeFilter(filter))
+		case validator.CREATE:
+			add = append(add, createFilter(filter))
+		default:
+			configlogger.Error("Error while building change spec: Unknown action type: %v", filter.Action)
+		}
+	}
+	return
+}
+
+func createDirector(d validator.Director) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return h.CreateDirector(d.Type, d.Name, d.Primitive)
+	}
+}
+func removeDirector(d validator.Director) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return fmt.Errorf("removeDirector not implemented")
+	}
+}
+func directorActions(specs []validator.Director) (add, remove []ConfigFunc) {
+	for _, d := range specs {
+		switch d.Action {
+		case validator.IGNORE, validator.KEEP:
+			// do nothing
+		case validator.DISCARD:
+			remove = append(remove, removeDirector(d))
+		case validator.CREATE:
+			add = append(add, createDirector(d))
+		default:
+			configlogger.Error("Errow hile building hange spec: Unknown action type: %v", d.Action)
+		}
+	}
+	return
+}
+
+func createService(service validator.Service) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return h.CreateService(service.Name, service.Type, service.Director, service.Primitive)
+	}
+}
+func removeService(service validator.Service) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return fmt.Errorf("removeService not implemented")
+	}
+}
+func serviceActions(specs []validator.Service) (add, remove []ConfigFunc) {
+	for _, service := range specs {
+		switch service.Action {
+		case validator.IGNORE, validator.KEEP:
+			// do nothing
+		case validator.DISCARD:
+			remove = append(remove, removeService(service))
+		case validator.CREATE:
+			add = append(add, createService(service))
+		default:
+			configlogger.Error("Error while building hange spec: Unknown action type: %v", service.Action)
+		}
+	}
+	return
+}
+
+func createPort(p validator.Port) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return h.CreatePort(p.Ports, p.Services)
+	}
+}
+func removePort(p validator.Port) ConfigFunc {
+	return func(h *Honeytrap) error {
+		return fmt.Errorf("removePort not implemented")
+	}
+}
+func portActions(specs []validator.Port) (add, remove []ConfigFunc) {
+	for _, p := range specs {
+		switch p.Action {
+		case validator.IGNORE, validator.KEEP:
+			// do nothing
+		case validator.DISCARD:
+			remove = append(remove, removePort(p))
+		case validator.CREATE:
+			add = append(add, createPort(p))
+		default:
+			configlogger.Error("Error while building hange spec: Unknown action type: %v", p.Action)
+		}
+	}
+	return
+}
+
+func (c *ConfigManager) createActions(s validator.ConfigSpec) []ConfigFunc {
+	removals := []ConfigFunc{}
+	additions := []ConfigFunc{}
+
+	a, b := channelActions(s.Channels)
+
+	additions = append(additions, a...)
+	removals = append(removals, b...)
+
+	a, b = filterActions(s.Filters)
+
+	additions = append(additions, a...)
+	removals = append(removals, b...)
+
+	a, b = directorActions(s.Directors)
+
+	additions = append(additions, a...)
+	removals = append(removals, b...)
+
+	a, b = serviceActions(s.Services)
+
+	additions = append(additions, a...)
+	removals = append(removals, b...)
+
+	a, b = portActions(s.Ports)
+
+	additions = append(additions, a...)
+	removals = append(removals, b...)
+
+	return append(removals, additions...)
+}
+
+func (c *ConfigManager) Reconfigure(validata *validator.Validata) {
+
+	//TODO: implement enhanced behaviour based on the aformentioned todo
+	// generate implementation functions
+	spec := validata.ConfigSpec()
+	actions := c.createActions(spec)
+
+	if len(actions) == 0 {
+		c.Logger.Info("No configuration changes found.")
+		return
+	}
+
+	c.Logger.Info("Passivating server")
+
+	// When config is valid, tell system to passivate
+	passivate := make(chan chan struct{}, 2)
+	//fmt.Println("created channel")
+	c.start <- passivate
+	//fmt.Println("sent passivation thingy")
+	ready := <-passivate
+	//fmt.Println("received all clear")
+
+	// Reconfigure Honeytrap
+	c.Logger.Info("(Re)Configuring HoneyTrap...")
+
+	for _, action := range actions {
+		if err := action(c.Honeytrap); err != nil {
+			c.Logger.Error("Error while applying new config: %s", err.Error())
+			//TODO implement rollback. NOTE to self: that's though
+		}
+	}
+
+	c.Honeytrap.config = spec.Config
+
+	if c.Honeytrap.ui != nil {
+		c.Honeytrap.PopulateServicesNode()
+	}
+
+	c.Logger.Info("Finished configuration changes")
+
+	c.Validata = validata
+
+	// Resume HoneyTrap when done
+	ready <- struct{}{}
+}
+
+func (c *ConfigManager) Send(e event.Event) {
+	if !(e.Get("category") == "configuration") {
+		//fmt.Println(e.Get("category"), e.Get("sensor"), e.Get("sequence"))
+		return // ignore non-config events
+	}
+
+	if e.Get("type") == "HONEYTRAP:UPDATE" {
+		c.Logger.Info("Validating Config")
+
+		if c.Validata == nil {
+			c.Logger.Error("Could not perform config update. Initial Config hasn't been supplied.")
+			return
+		}
+
+		file := e.Get("file")
+
+		if file == "" {
+			c.Logger.Error("Cannot read config file location")
+			return
+		}
+
+		cfg := getConfig(file)
+
+		v := validator.Validator{
+			Replace:        false,
+			RemoveExisting: false,
+		}
+		validata, err := v.Validate(c.Validata, cfg)
+
+		if err != nil {
+			log.Errorf("Error while reconfiguring: %s", err.Error())
+			return
+		}
+
+		c.Reconfigure(validata)
+		return
+	}
+
+	if e.Get("type") == "HONEYTRAP:OVERWRITE" {
+		c.Logger.Info("Validating Config")
+
+		if c.Validata == nil {
+			c.Logger.Error("Could not perform config update. Initial Config hasn't been supplied.")
+			return
+		}
+
+		file := e.Get("file")
+
+		if file == "" {
+			c.Logger.Error("Cannot read config file location")
+			return
+		}
+
+		cfg := getConfig(file)
+
+		v := validator.Validator{
+			Replace:        false,
+			RemoveExisting: true,
+		}
+
+		validata, err := v.Validate(c.Validata, cfg)
+
+		if err != nil {
+			log.Errorf("Error while reconfiguring: %s", err.Error())
+			return
+		}
+
+		c.Reconfigure(validata)
+		return
+	}
+
+	if e.Get("type") == "HONEYTRAP:INIT" {
+		// TODO: Should change this to reading an input file
+		c.Logger.Info("Validating Config")
+
+		v := validator.Validator{
+			Replace:        false,
+			RemoveExisting: false,
+		}
+
+		validata, err := v.Validate(nil, c.Honeytrap.config)
+
+		if err != nil {
+			log.Errorf("Eror while reconfiguring: %s", err.Error())
+			return
+		}
+
+		c.Reconfigure(validata)
+	}
+}
+
+func (c *ConfigManager) Fake() {
+	// fake
+}
+
+func (c *ConfigManager) PauseChan() chan chan chan struct{} {
+	return c.start
+}
+
+type State int
+
+const (
+	QUIET State = 1 + iota
+	PASSIVE
+	ACTIVE
+)
+
+//NOTE remove this after presentation
+func getConfig(path string) *config.Config {
+	u, e := url.Parse(path)
+	if e != nil {
+		log.Error(e.Error())
+		return nil
+	}
+
+	var data []byte
+
+	if u.Scheme == "http" || u.Scheme == "https" {
+		resp, err := http.Get(u.Path)
+		if err != nil {
+			log.Error(err.Error())
+			return nil
+		}
+		defer resp.Body.Close()
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Error(err.Error())
+			return nil
+		}
+		data = body
+	} else {
+		contents, err := ioutil.ReadFile(u.Path)
+		if err != nil {
+			log.Error(err.Error())
+			return nil
+		}
+		data = contents
+	}
+
+	conf := config.Default
+	conf.Load(bytes.NewBuffer(data))
+
+	return &conf
 }
 
 // Run will start honeytrap
@@ -706,7 +1086,8 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 
 	hc.profiler.Start()
 
-	hc.config = validator.Validate(hc.config)
+	manager := NewConfigManager(hc)
+	hc.bus.Subscribe(manager)
 
 	w, err := web.New(
 		web.WithEventBus(hc.bus),
@@ -723,118 +1104,6 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 	// maybe we can rewrite pushers / channels to use global bus instead
 	bc := pushers.NewBusChannel()
 	hc.bus.Subscribe(bc)
-
-	//TODO pimvanhespen: get this map out of here
-	isChannelUsed := make(map[string]bool)
-
-	// sane defaults!
-
-	//create channels
-	for key, channelConfig := range hc.config.Channels {
-
-		channel := hc.CreateChannel(key, channelConfig)
-		if channel == nil {
-			continue
-		}
-
-		hc.channels[key] = channel
-		isChannelUsed[key] = false
-
-	}
-
-	// create filters
-	for _, s := range hc.config.Filters {
-
-		x := struct {
-			Channels   []string `toml:"channel"`
-			Services   []string `toml:"services"`
-			Categories []string `toml:"categories"`
-		}{}
-
-		err := hc.config.PrimitiveDecode(s, &x)
-		if err != nil {
-			log.Error("Error parsing configuration of filter: %s", err.Error())
-			continue
-		}
-
-		for _, name := range x.Channels {
-			channel, ok := hc.channels[name]
-			if !ok {
-				log.Error("Could not find channel %s for filter", name)
-				continue
-			}
-
-			isChannelUsed[name] = true
-			channel = pushers.TokenChannel(channel, hc.token)
-
-			if len(x.Categories) != 0 {
-				channel = pushers.FilterChannel(channel, pushers.RegexFilterFunc("category", x.Categories))
-			}
-
-			if len(x.Services) != 0 {
-				channel = pushers.FilterChannel(channel, pushers.RegexFilterFunc("service", x.Services))
-			}
-
-			if err := hc.bus.Subscribe(channel); err != nil {
-				log.Error("Could not add channel %s to bus: %s", name, err.Error())
-			}
-		}
-	}
-
-	// check if all channels are in use
-	for name, isUsed := range isChannelUsed {
-		if !isUsed {
-			log.Warningf("Channel %s is unused. Did you forget to add a filter?", name)
-		}
-	}
-
-	// initialize directors
-
-	// variable only used for error.
-	availableDirectorNames := director.GetAvailableDirectorNames()
-
-	for key, s := range hc.config.Directors {
-		x := struct {
-			Type string `toml:"type"`
-		}{}
-
-		err := hc.config.PrimitiveDecode(s, &x)
-		if err != nil {
-			log.Error("Error parsing configuration of director: %s", err.Error())
-			continue
-		}
-
-		if x.Type == "" {
-			log.Error("Error parsing configuration of service %s: type not set", key)
-			continue
-		}
-
-		if directorFunc, ok := director.Get(x.Type); !ok {
-			log.Error("Director type=%s not supported on platform (director=%s). Available directors: %s", x.Type, key, strings.Join(availableDirectorNames, ", "))
-		} else if d, err := directorFunc(
-			director.WithChannel(hc.bus),
-			director.WithConfig(s, hc.config),
-		); err != nil {
-			log.Fatalf("Error initializing director %s(%s): %s", key, x.Type, err)
-		} else {
-			hc.directors[key] = d
-		}
-	}
-
-	var enabledDirectorNames []string
-	for key := range hc.directors {
-		enabledDirectorNames = append(enabledDirectorNames, key)
-	}
-
-	// same for services
-	for key, s := range hc.config.Services {
-		service := hc.CreateService(key, s)
-		if service == nil {
-			continue
-		}
-		hc.services[key] = service
-		log.Infof("Configured service (%s)", key) // x.Type removed
-	}
 
 	// initialize listener
 	x := struct {
@@ -864,30 +1133,12 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		log.Fatalf("Error initializing listener %s: %s", x.Type, err)
 	}
 
-	// init ports
-	for _, s := range hc.config.Ports {
-		hc.CreatePort(s, l)
+	if err := l.Start(ctx); err != nil {
+		fmt.Println(color.RedString("Error starting listener: %s", err.Error()))
+		return
 	}
 
-	//check if all services are assigned to ports
-	knownServicePointers := []*ServiceMap{}
-	for _, serviceMaps := range hc.ports {
-		knownServicePointers = append(knownServicePointers, serviceMaps...)
-	}
-
-	for serviceName, serviceMapPointer := range hc.services {
-		// check if service is listed in the services mapped to ports
-		if !func() bool {
-			for _, pointer := range knownServicePointers {
-				if pointer == serviceMapPointer {
-					return true
-				}
-			}
-			return false
-		}() {
-			log.Warningf("Service %s is defined but not used", serviceName)
-		}
-	}
+	hc.listnr = l
 
 	// config of mini diplay
 	if len(hc.config.MiniDisplay) == 0 {
@@ -897,17 +1148,7 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 		hc.CreateMiniDisplay()
 	}
 
-	if len(hc.config.Undecoded()) != 0 {
-		log.Warningf("Unrecognized keys in configuration: %v", hc.config.Undecoded())
-	}
-
-	if err := l.Start(ctx); err != nil {
-		fmt.Println(color.RedString("Error starting listener: %s", err.Error()))
-		return
-	}
-
 	incoming := make(chan net.Conn)
-
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -921,14 +1162,74 @@ func (hc *Honeytrap) Run(ctx context.Context) {
 			// with many connection and single procs
 			runtime.Gosched()
 		}
+
 	}()
 
+	go func() {
+		pause := manager.PauseChan()
+		for {
+			paused := <-pause
+			//log.Info("Passivating")
+			hc.State = PASSIVE
+			wait := make(chan struct{}, 1)
+			paused <- wait
+			//log.Info("Ready to reconfigure")
+			<-wait
+
+			if hc.ui != nil {
+				hc.ui.Refresh()
+			}
+			hc.State = ACTIVE
+			//log.Info("Reconfigured, Resuming business")
+
+		}
+	}()
+
+	go func() {
+		time.Sleep(time.Second * 1)
+		log.Info("Sending config event")
+		hc.bus.Send(event.New(
+			event.Sensor("honeytrap"),
+			event.Category("configuration"),
+			event.Type("HONEYTRAP:INIT"),
+		))
+		time.Sleep(time.Second * 2)
+		log.Info("Sending config event")
+		hc.bus.Send(event.New(
+			event.Sensor("honeytrap"),
+			event.Category("configuration"),
+			event.Type("HONEYTRAP:UPDATE"),
+			event.Custom("file", "./config-profile-3.toml"),
+		))
+		/*
+			time.Sleep(time.Second * 3)
+			log.Info("Sending config event")
+			hc.bus.Send(event.New(
+				event.Sensor("honeytrap"),
+				event.Category("configuration"),
+				event.Type("HONEYTRAP:OVERWRITE"),
+				event.Custom("file", "./config-profile-1.toml"),
+			))
+		*/
+	}()
+
+	buffer := []net.Conn{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case conn := <-incoming:
+			if hc.State != ACTIVE {
+				buffer = append(buffer, conn)
+				continue
+			}
 			go hc.handle(conn)
+		default:
+			//NOTE is this safe?
+			if hc.State == ACTIVE && len(buffer) > 0 {
+				go hc.handle(buffer[0])
+				buffer = buffer[1:]
+			}
 		}
 	}
 }

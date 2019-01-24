@@ -58,3 +58,21 @@ func (eb *EventBus) Send(e event.Event) {
 		subscriber.Send(e)
 	}
 }
+
+/* NOTE work in progres..
+//Removes a subscriver from the slice
+func (eb *EventBus) UnSubscribe(channel pushers.Channel) error {
+	found = -1
+	for index, sub := range eb.subscribers {
+		if &sub == &channel {
+			found = index
+			break
+		}
+	}
+	if found < 0 {
+		return fmt.Errorf("No match found")
+	}
+	eb.subscribers = append(eb.subscribers[:found], eb.subscribers[found+1:])
+	return
+}
+*/

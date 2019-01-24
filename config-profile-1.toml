@@ -1,0 +1,69 @@
+### All listeners are under honeytrap/listeners ###
+###   for R.pi only socket and agent are of intrest ###
+
+[listener]
+type="socket"
+#listen=":1337"
+
+### All services are under honeytrap/services ###
+
+[service.ldap]
+type="ldap"
+credentials=["admin:admin", "root:root"]
+naming-contexts=[ "dc=example,dc=com", "dc=ad,dc=myserver,dc=com" ]
+supported-ldap-version=[ "3" ]
+#supported-extension=[ "1.3.6.1.4.1.1466.20037" ]
+vendor-name=[ "HT Directory Server" ]
+vendor-version=[ "0.1.0.0" ]
+description=[ "Directory Server" ]
+objectclass=[ "dcObject", "organization" ]
+
+[[port]]
+port="tcp/10389"
+services=["ldap"]
+
+[service.ftp]
+type="ftp"
+banner="Welcome to FTP"
+name="FTPd"
+fs_base="/tmp"
+##Username and password
+#users=[ ["anonymous", "anonymous"], ["admin", "admin"] ]
+##passive-port-range=""
+#passive-port-range="20200-20250"
+
+[[port]]
+port="tcp/8021"
+services=["ftp"]
+
+[service.smtp]
+type="smtp"
+host="smtp.mailer.org"
+#name="HT SMTP-E v2.3.0.1b"
+#banner-fmt='{{.Host}} {{.Name}} - Ready'
+#users=[ ["root","root"], ["admin", "admin"] ]
+#secrets=[ ["user", "password"] ]
+
+[[port]]
+port="tcp/8025"
+services=["smtp"]
+
+# the console channel will log all events to the console
+[channel.console]
+type="console"
+
+# the file channel will log all events to file
+[channel.file]
+type="file"
+filename="/tmp/honeytrap.log"
+
+[[filter]]
+channel=["console"]
+
+[[filter]]
+channel=["file"]
+services=["smtp","ldap"]
+
+[[logging]]
+output = "stdout"
+level = "debug"

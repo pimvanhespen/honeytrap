@@ -220,7 +220,13 @@ func serve(c *cli.Context) error {
 
 		conf := &config.Default
 		conf.Load(bytes.NewBuffer(data))
-		validator.Validate(conf)
+
+		v := validator.Validator{
+			Replace:        false,
+			RemoveExisting: false,
+		}
+
+		v.Validate(nil, conf)
 		return nil
 	}
 
